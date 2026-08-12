@@ -1,0 +1,74 @@
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.0
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster-token=etcd-cluster-token
+      - --initial-cluster=etcd=http://etcd:2380
+      - --initial-cluster-state=new
+    ports:
+      - "2379:2379"
+
+  metadata-server:
+    build:
+      context: ..
+      dockerfile: docker/metadata.Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - GIN_MODE=release
+    command: ["./metadata-server", "-config", "configs/config.yaml", "-db", "/app/data/metadata.db"]
+    volumes:
+      - metadata-db-data:/app/data
+    depends_on:
+      - etcd
+
+  storage-node-1:
+    build:
+      context: ..
+      dockerfile: docker/storage.Dockerfile
+    ports:
+      - "8081:8081"
+    command: ["./storage-node", "-config", "configs/config.yaml", "-id", "storage-node-1", "-port", "8081", "-dir", "/data/node-1", "-etcd", "etcd:2379", "-metadata-url", "http://metadata-server:8000"]
+    volumes:
+      - storage-node-1-data:/data/node-1
+    depends_on:
+      - etcd
+      - metadata-server
+
+  storage-node-2:
+    build:
+      context: ..
+      dockerfile: docker/storage.Dockerfile
+    ports:
+      - "8082:8082"
+    command: ["./storage-node", "-config", "configs/config.yaml", "-id", "storage-node-2", "-port", "8082", "-dir", "/data/node-2", "-etcd", "etcd:2379", "-metadata-url", "http://metadata-server:8000"]
+    volumes:
+      - storage-node-2-data:/data/node-2
+    depends_on:
+      - etcd
+      - metadata-server
+
+  storage-node-3:
+    build:
+      context: ..
+      dockerfile: docker/storage.Dockerfile
+    ports:
+      - "8083:8083"
+    command: ["./storage-node", "-config", "configs/config.yaml", "-id", "storage-node-3", "-port", "8083", "-dir", "/data/node-3", "-etcd", "etcd:2379", "-metadata-url", "http://metadata-server:8000"]
+    volumes:
+      - storage-node-3-data:/data/node-3
+    depends_on:
+      - etcd
+      - metadata-server
+
+volumes:
+  metadata-db-data:
+  storage-node-1-data:
+  storage-node-2-data:
+  storage-node-3-data:

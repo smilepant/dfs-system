@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DFS — Distributed File System Dashboard</title>
+  <meta name="description" content="Test and monitor your Distributed File System — upload, download, and inspect nodes in real-time." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:          #0a0e1a;
+      --surface:     #111827;
+      --surface2:    #1a2235;
+      --border:      rgba(255,255,255,0.07);
+      --accent:      #6366f1;
+      --accent2:     #8b5cf6;
+      --green:       #10b981;
+      --red:         #ef4444;
+      --yellow:      #f59e0b;
+      --text:        #f1f5f9;
+      --muted:       #64748b;
+      --code:        #e879f9;
+      --glow:        rgba(99,102,241,0.25);
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ── Background grid ── */
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background-image:
+        linear-gradient(rgba(99,102,241,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(99,102,241,0.03) 1px, transparent 1px);
+      background-size: 40px 40px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ── Header ── */
+    header {
+      position: sticky; top: 0; z-index: 100;
+      background: rgba(10,14,26,0.8);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 2rem;
+      height: 64px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .logo { display: flex; align-items: center; gap: 12px; }
+    .logo-icon {
+      width: 38px; height: 38px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px;
+      box-shadow: 0 0 20px var(--glow);
+    }
+    .logo-text { font-size: 1.1rem; font-weight: 700; letter-spacing: -0.02em; }
+    .logo-text span { color: var(--accent); }
+    .header-meta { font-size: 0.78rem; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
+    .status-pill {
+      display: flex; align-items: center; gap: 6px;
+      background: rgba(16,185,129,0.1);
+      border: 1px solid rgba(16,185,129,0.25);
+      color: var(--green); font-size: 0.78rem; font-weight: 500;
+      padding: 4px 12px; border-radius: 99px;
+      transition: all 0.3s;
+    }
+    .status-pill.offline { background: rgba(239,68,68,0.1); border-color: rgba(239,68,68,0.25); color: var(--red); }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+    /* ── Main layout ── */
+    main { position: relative; z-index: 1; max-width: 1280px; margin: 0 auto; padding: 2.5rem 2rem; }
+
+    /* ── Section headings ── */
+    .section-label {
+      font-size: 0.7rem; font-weight: 600; letter-spacing: 0.12em;
+      text-transform: uppercase; color: var(--accent);
+      display: flex; align-items: center; gap: 8px; margin-bottom: 1rem;
+    }
+    .section-label::after { content:''; flex:1; height:1px; background: var(--border); }
+    h2 { font-size: 1.3rem; font-weight: 700; margin-bottom: 1.5rem; }
+
+    /* ── Card ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 1.5rem;
+      transition: border-color 0.3s;
+    }
+    .card:hover { border-color: rgba(99,102,241,0.2); }
+
+    /* ── Config bar ── */
+    .config-bar {
+      display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 1rem 1.5rem; margin-bottom: 2rem;
+    }
+    .config-bar label { font-size: 0.78rem; color: var(--muted); font-weight: 500; }
+    .config-bar input {
+      background: var(--surface2); border: 1px solid var(--border);
+      color: var(--text); padding: 6px 12px; border-radius: 8px;
+      font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; width: 220px;
+      transition: border-color 0.2s;
+    }
+    .config-bar input:focus { outline: none; border-color: var(--accent); }
+    .btn {
+      display: inline-flex; align-items: center; gap: 7px;
+      padding: 8px 18px; border-radius: 9px; font-size: 0.85rem;
+      font-weight: 600; cursor: pointer; border: none;
+      transition: all 0.2s; white-space: nowrap;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      color: #fff; box-shadow: 0 4px 15px var(--glow);
+    }
+    .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 6px 20px var(--glow); }
+    .btn-primary:active { transform: translateY(0); }
+    .btn-ghost {
+      background: var(--surface2); color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-sm { padding: 5px 12px; font-size: 0.78rem; border-radius: 7px; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none !important; }
+
+    /* ── Upload zone ── */
+    .upload-zone {
+      border: 2px dashed var(--border);
+      border-radius: 16px; padding: 3.5rem 2rem;
+      text-align: center; cursor: pointer;
+      transition: all 0.3s; position: relative; overflow: hidden;
+      background: var(--surface);
+    }
+    .upload-zone:hover, .upload-zone.dragover {
+      border-color: var(--accent);
+      background: rgba(99,102,241,0.05);
+      box-shadow: inset 0 0 40px rgba(99,102,241,0.06);
+    }
+    .upload-zone.dragover { transform: scale(1.01); }
+    .upload-icon {
+      font-size: 3.5rem; margin-bottom: 1rem;
+      filter: drop-shadow(0 0 20px var(--accent));
+      animation: float 3s ease-in-out infinite;
+    }
+    @keyframes float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-8px)} }
+    .upload-zone h3 { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.4rem; }
+    .upload-zone p { color: var(--muted); font-size: 0.85rem; }
+    .upload-zone input[type=file] { display: none; }
+    .file-selected-name {
+      display: none; margin-top: 1rem;
+      background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.25);
+      padding: 8px 16px; border-radius: 8px; font-size: 0.82rem;
+      font-family: 'JetBrains Mono', monospace; color: var(--accent);
+    }
+
+    /* ── Progress bar ── */
+    .progress-wrap {
+      display: none; margin-top: 1.5rem;
+      background: var(--surface2); border-radius: 99px; height: 8px; overflow: hidden;
+    }
+    .progress-bar {
+      height: 100%; width: 0%;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      border-radius: 99px; transition: width 0.3s;
+      animation: shimmer 1.5s infinite;
+    }
+    @keyframes shimmer {
+      0%   { box-shadow: 0 0 0 0 rgba(99,102,241,0.4); }
+      50%  { box-shadow: 0 0 12px 4px rgba(99,102,241,0.2); }
+      100% { box-shadow: 0 0 0 0 rgba(99,102,241,0.4); }
+    }
+    .progress-label { margin-top: 0.5rem; font-size: 0.78rem; color: var(--muted); text-align: center; }
+
+    /* ── Grid ── */
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media(max-width:900px){ .grid2{ grid-template-columns:1fr; } }
+
+    /* ── Nodes grid ── */
+    .nodes-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 1rem; }
+    .node-card {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 14px; padding: 1.2rem;
+      transition: all 0.3s; position: relative; overflow: hidden;
+    }
+    .node-card::before {
+      content: ''; position: absolute; inset: 0;
+      background: linear-gradient(135deg, rgba(99,102,241,0.04), transparent);
+      pointer-events: none;
+    }
+    .node-card.online { border-color: rgba(16,185,129,0.25); }
+    .node-card.offline { border-color: rgba(239,68,68,0.2); opacity: 0.6; }
+    .node-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+    .node-id { font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; font-weight: 500; }
+    .badge {
+      font-size: 0.68rem; font-weight: 700; padding: 2px 8px; border-radius: 99px;
+      text-transform: uppercase; letter-spacing: 0.06em;
+    }
+    .badge-green { background: rgba(16,185,129,0.15); color: var(--green); }
+    .badge-red   { background: rgba(239,68,68,0.15);  color: var(--red);   }
+    .badge-gray  { background: rgba(100,116,139,0.15); color: var(--muted); }
+    .storage-bar-wrap { background: var(--bg); border-radius: 99px; height: 6px; overflow: hidden; margin-top: 0.4rem; }
+    .storage-bar { height: 100%; border-radius: 99px; background: linear-gradient(90deg, var(--green), #34d399); transition: width 0.8s; }
+    .node-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; margin-bottom: 0.8rem; }
+    .node-stat-label { font-size: 0.68rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+    .node-stat-val { font-size: 0.88rem; font-weight: 600; font-family: 'JetBrains Mono', monospace; }
+
+    /* ── Files table ── */
+    .table-wrap { overflow-x: auto; border-radius: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    thead th {
+      background: var(--surface2); padding: 10px 16px;
+      text-align: left; font-size: 0.7rem; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
+    }
+    thead th:first-child { border-radius: 10px 0 0 10px; }
+    thead th:last-child  { border-radius: 0 10px 10px 0; }
+    tbody tr {
+      border-bottom: 1px solid var(--border);
+      transition: background 0.15s;
+    }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: rgba(99,102,241,0.04); }
+    td { padding: 12px 16px; vertical-align: middle; }
+    .file-name { font-weight: 500; display: flex; align-items: center; gap: 8px; }
+    .file-icon { font-size: 1.1rem; }
+    .mono { font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; color: var(--muted); }
+    .chunk-pill {
+      display: inline-flex; align-items: center; gap: 4px;
+      background: rgba(99,102,241,0.1); color: var(--accent);
+      border: 1px solid rgba(99,102,241,0.2);
+      font-size: 0.72rem; font-weight: 600;
+      padding: 2px 9px; border-radius: 99px;
+    }
+    .status-active { color: var(--green); font-weight: 600; font-size: 0.78rem; }
+    .status-pending { color: var(--yellow); font-weight: 600; font-size: 0.78rem; }
+    .status-failed  { color: var(--red);    font-weight: 600; font-size: 0.78rem; }
+
+    /* ── Empty state ── */
+    .empty-state { text-align: center; padding: 3rem; color: var(--muted); }
+    .empty-state .empty-icon { font-size: 3rem; margin-bottom: 1rem; opacity: 0.4; }
+    .empty-state p { font-size: 0.9rem; }
+
+    /* ── Toast notifications ── */
+    #toast-container {
+      position: fixed; bottom: 1.5rem; right: 1.5rem;
+      display: flex; flex-direction: column; gap: 10px; z-index: 9999;
+    }
+    .toast {
+      display: flex; align-items: center; gap: 10px;
+      background: var(--surface); border: 1px solid var(--border);
+      padding: 12px 18px; border-radius: 12px;
+      font-size: 0.85rem; font-weight: 500;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      animation: toastIn 0.3s ease;
+      max-width: 340px;
+    }
+    .toast.success { border-color: rgba(16,185,129,0.35); }
+    .toast.error   { border-color: rgba(239,68,68,0.35);  }
+    .toast.info    { border-color: rgba(99,102,241,0.35); }
+    @keyframes toastIn { from{ transform: translateX(100%); opacity:0; } to{ transform: translateX(0); opacity:1; } }
+    @keyframes toastOut { to{ transform: translateX(110%); opacity:0; } }
+
+    /* ── Spinner ── */
+    .spinner {
+      width: 16px; height: 16px;
+      border: 2px solid rgba(255,255,255,0.2);
+      border-top-color: #fff; border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Upload result card ── */
+    #upload-result {
+      display: none; margin-top: 1.5rem;
+      background: rgba(16,185,129,0.06);
+      border: 1px solid rgba(16,185,129,0.2);
+      border-radius: 12px; padding: 1.2rem;
+    }
+    #upload-result h4 { color: var(--green); font-size: 0.9rem; margin-bottom: 0.6rem; display: flex; align-items: center; gap: 6px; }
+    #upload-result pre {
+      font-family: 'JetBrains Mono', monospace; font-size: 0.74rem;
+      color: var(--muted); overflow-x: auto;
+      background: var(--bg); padding: 0.8rem; border-radius: 8px;
+      max-height: 180px; overflow-y: auto;
+    }
+
+    /* ── Divider ── */
+    .section-gap { margin-top: 2.5rem; }
+
+    /* ── Tooltip ── */
+    [data-tip] { position: relative; cursor: help; }
+    [data-tip]:hover::after {
+      content: attr(data-tip);
+      position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
+      background: #1e293b; border: 1px solid var(--border);
+      color: var(--text); font-size: 0.72rem; padding: 4px 10px; border-radius: 6px;
+      white-space: nowrap; pointer-events: none; z-index: 200;
+    }
+
+    /* ── Refresh button spin ── */
+    .refreshing { animation: spin 0.7s linear infinite; }
+
+    /* Header right cluster */
+    .header-right { display: flex; align-items: center; gap: 14px; }
+  </style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header>
+  <div class="logo">
+    <div>
+      <div class="logo-text">D<span>F</span>S Dashboard</div>
+      <div class="header-meta">Distributed File System</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div id="server-status" class="status-pill offline">
+      <span class="status-dot"></span>
+      <span id="server-status-text">Connecting…</span>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="refreshAll()" id="refresh-btn" title="Refresh all">
+      <span id="refresh-icon">⟳</span> Refresh
+    </button>
+  </div>
+</header>
+
+<!-- MAIN -->
+<main>
+
+  <!-- Config bar -->
+  <div class="config-bar">
+    <label for="server-url">Metadata Server URL</label>
+    <input id="server-url" type="text" value="http://localhost:8000" placeholder="http://localhost:8000" />
+    <label for="node-urls">Storage Node Ports</label>
+    <input id="node-urls" type="text" value="8081,8082,8083" placeholder="8081,8082,8083" style="width:160px" />
+    <button class="btn btn-primary btn-sm" onclick="refreshAll()">Connect</button>
+  </div>
+
+  <!-- Upload section -->
+  <div class="section-label">📤 Upload</div>
+
+  <div class="grid2">
+    <div class="card">
+      <label for="file-input">
+        <div class="upload-zone" id="drop-zone">
+          <div class="upload-icon">☁️</div>
+          <h3>Drop a file here</h3>
+          <p>or click to browse — any file type, any size</p>
+          <div class="file-selected-name" id="file-selected-name"></div>
+          <input type="file" id="file-input" />
+        </div>
+      </label>
+      <div class="progress-wrap" id="progress-wrap">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <p class="progress-label" id="progress-label"></p>
+      <div style="display:flex;gap:10px;margin-top:1.2rem">
+        <button class="btn btn-primary" id="upload-btn" onclick="uploadFile()" disabled>
+          <span>⬆</span> Upload to DFS
+        </button>
+        <button class="btn btn-ghost btn-sm" onclick="clearUpload()">Clear</button>
+      </div>
+      <div id="upload-result">
+        <h4>✅ Upload Successful</h4>
+        <pre id="upload-result-json"></pre>
+      </div>
+    </div>
+
+    <!-- Quick Actions -->
+    <div class="card" style="display:flex;flex-direction:column;gap:1rem">
+      <div>
+        <div class="section-label" style="font-size:0.68rem">⚡ Quick Actions</div>
+        <p style="font-size:0.82rem;color:var(--muted);margin-bottom:1rem">Download a file by its ID returned from upload.</p>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <input id="download-id" type="number" min="1" placeholder="File ID…"
+            style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:0.85rem;width:110px" />
+          <button class="btn btn-primary" onclick="downloadFile()">⬇ Download</button>
+        </div>
+      </div>
+
+      <div style="border-top:1px solid var(--border);padding-top:1rem">
+        <div class="section-label" style="font-size:0.68rem">ℹ️ API Reference</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:0.73rem;color:var(--muted);display:flex;flex-direction:column;gap:6px">
+          <div><span style="color:var(--green)">POST</span>  <span style="color:var(--accent)">/upload</span>          multipart/form-data</div>
+          <div><span style="color:var(--accent)">GET</span>   <span style="color:var(--accent)">/download/:fileId</span>  binary stream</div>
+          <div><span style="color:var(--accent)">GET</span>   <span style="color:var(--accent)">/files</span>            JSON array</div>
+          <div><span style="color:var(--green)">POST</span>  <span style="color:var(--accent)">/nodes/register</span>   JSON body</div>
+          <div><span style="color:var(--accent)">GET</span>   <span style="color:var(--accent)">/health</span>           node health</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Storage nodes -->
+  <div class="section-gap">
+    <div class="section-label">🖥️ Storage Nodes</div>
+    <div class="nodes-grid" id="nodes-grid">
+      <div class="empty-state" style="grid-column:1/-1">
+        <div class="empty-icon">⏳</div>
+        <p>Connecting to nodes…</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Files table -->
+  <div class="section-gap">
+    <div class="section-label">📁 Stored Files</div>
+    <div class="card" style="padding:0;overflow:hidden">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:1.2rem 1.5rem;border-bottom:1px solid var(--border)">
+        <div>
+          <span style="font-weight:600">File Registry</span>
+          <span id="file-count" style="font-size:0.78rem;color:var(--muted);margin-left:10px">Loading…</span>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="loadFiles()">↺ Reload</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Filename</th>
+              <th>Size</th>
+              <th>Chunks</th>
+              <th>Status</th>
+              <th>Created</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="files-tbody">
+            <tr><td colspan="7"><div class="empty-state"><div class="empty-icon">📭</div><p>No files found. Upload one above!</p></div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<!-- TOAST CONTAINER -->
+<div id="toast-container"></div>
+
+<script>
+  /* ─── Helpers ─── */
+  const $ = id => document.getElementById(id);
+  function baseURL() { return ($('server-url').value || 'http://localhost:8000').replace(/\/$/, ''); }
+  function nodePorts() { return ($('node-urls').value || '8081,8082,8083').split(',').map(s => s.trim()).filter(Boolean); }
+
+  function fmt(bytes) {
+    if (bytes == null) return '—';
+    if (bytes >= 1e9) return (bytes/1e9).toFixed(2) + ' GB';
+    if (bytes >= 1e6) return (bytes/1e6).toFixed(2) + ' MB';
+    if (bytes >= 1e3) return (bytes/1e3).toFixed(1) + ' KB';
+    return bytes + ' B';
+  }
+
+  function fileIcon(name) {
+    const ext = (name||'').split('.').pop().toLowerCase();
+    const map = { png:'🖼️', jpg:'🖼️', jpeg:'🖼️', gif:'🖼️', svg:'🖼️', webp:'🖼️',
+                  mp4:'🎬', mkv:'🎬', avi:'🎬', mov:'🎬',
+                  mp3:'🎵', wav:'🎵', flac:'🎵',
+                  pdf:'📄', doc:'📝', docx:'📝', xls:'📊', xlsx:'📊',
+                  zip:'📦', tar:'📦', gz:'📦', rar:'📦',
+                  js:'⚙️', ts:'⚙️', go:'⚙️', py:'🐍', sh:'💻',
+                  txt:'📃', md:'📃', json:'📋', yaml:'📋', yml:'📋' };
+    return map[ext] || '📄';
+  }
+
+  /* ─── Toasts ─── */
+  function toast(msg, type='info', duration=3500) {
+    const icons = { success:'✅', error:'❌', info:'ℹ️' };
+    const el = document.createElement('div');
+    el.className = `toast ${type}`;
+    el.innerHTML = `<span>${icons[type]}</span><span>${msg}</span>`;
+    $('toast-container').appendChild(el);
+    setTimeout(() => {
+      el.style.animation = 'toastOut 0.3s ease forwards';
+      setTimeout(() => el.remove(), 300);
+    }, duration);
+  }
+
+  /* ─── Server status ─── */
+  async function checkServerStatus() {
+    try {
+      const r = await fetch(baseURL() + '/files', { signal: AbortSignal.timeout(3000) });
+      if (r.ok) {
+        $('server-status').className = 'status-pill';
+        $('server-status-text').textContent = 'Online';
+        return true;
+      }
+    } catch {}
+    $('server-status').className = 'status-pill offline';
+    $('server-status-text').textContent = 'Offline';
+    return false;
+  }
+
+  /* ─── Node health ─── */
+  async function loadNodes() {
+    const ports = nodePorts();
+    const grid = $('nodes-grid');
+    grid.innerHTML = '';
+
+    const results = await Promise.allSettled(
+      ports.map(async port => {
+        const base = baseURL().replace(/:\d+$/, '');
+        const url = `${base}:${port}/health`;
+        const r = await fetch(url, { signal: AbortSignal.timeout(3000) });
+        if (!r.ok) throw new Error('bad status');
+        return { port, data: await r.json() };
+      })
+    );
+
+    results.forEach((res, i) => {
+      const port = ports[i];
+      const online = res.status === 'fulfilled';
+      const data = online ? res.value.data : null;
+      const used = data ? data.total_space - data.free_space : 0;
+      const pct  = data ? ((used / data.total_space) * 100).toFixed(1) : 0;
+
+      grid.innerHTML += `
+        <div class="node-card ${online ? 'online' : 'offline'}">
+          <div class="node-header">
+            <span class="node-id">:${port} ${data ? '— ' + (data.node_id || '') : ''}</span>
+            <span class="badge ${online ? 'badge-green' : 'badge-red'}">${online ? 'Online' : 'Offline'}</span>
+          </div>
+          ${online ? `
+            <div class="node-stats">
+              <div>
+                <div class="node-stat-label">Total</div>
+                <div class="node-stat-val">${fmt(data.total_space)}</div>
+              </div>
+              <div>
+                <div class="node-stat-label">Free</div>
+                <div class="node-stat-val">${fmt(data.free_space)}</div>
+              </div>
+              <div>
+                <div class="node-stat-label">Used</div>
+                <div class="node-stat-val">${fmt(used)}</div>
+              </div>
+              <div>
+                <div class="node-stat-label">Usage</div>
+                <div class="node-stat-val">${pct}%</div>
+              </div>
+            </div>
+            <div class="storage-bar-wrap">
+              <div class="storage-bar" style="width:${pct}%"></div>
+            </div>
+          ` : `
+            <div style="font-size:0.82rem;color:var(--muted);margin-top:0.5rem">
+              Could not reach <span style="font-family:'JetBrains Mono',monospace">localhost:${port}/health</span>
+            </div>
+          `}
+        </div>`;
+    });
+  }
+
+  /* ─── File list ─── */
+  async function loadFiles() {
+    const tbody = $('files-tbody');
+    try {
+      const r = await fetch(baseURL() + '/files', { signal: AbortSignal.timeout(5000) });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const files = await r.json();
+
+      if (!files || files.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state"><div class="empty-icon">📭</div><p>No files yet — upload something!</p></div></td></tr>`;
+        $('file-count').textContent = '0 files';
+        return;
+      }
+
+      $('file-count').textContent = `${files.length} file${files.length !== 1 ? 's' : ''}`;
+
+      tbody.innerHTML = files.map(f => {
+        const statusClass = f.status === 'ACTIVE' ? 'status-active' : f.status === 'PENDING' ? 'status-pending' : 'status-failed';
+        const chunkCount  = f.chunks ? f.chunks.length : '—';
+        const created = f.created_at ? new Date(f.created_at).toLocaleString() : '—';
+        return `
+          <tr>
+            <td class="mono">#${f.id}</td>
+            <td>
+              <div class="file-name">
+                <span class="file-icon">${fileIcon(f.filename)}</span>
+                <span>${f.filename}</span>
+              </div>
+            </td>
+            <td class="mono">${fmt(f.size_bytes)}</td>
+            <td><span class="chunk-pill">◼ ${chunkCount}</span></td>
+            <td><span class="${statusClass}">${f.status}</span></td>
+            <td class="mono" style="font-size:0.75rem">${created}</td>
+            <td>
+              <div style="display:flex;gap:6px">
+                <button class="btn btn-ghost btn-sm" onclick="downloadById(${f.id}, '${f.filename}')">⬇ Download</button>
+                <button class="btn btn-ghost btn-sm" onclick="inspectFile(${f.id})" data-tip="View chunk map">🔍</button>
+              </div>
+            </td>
+          </tr>`;
+      }).join('');
+    } catch(e) {
+      tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state"><div class="empty-icon">⚠️</div><p>Failed to load files: ${e.message}</p></div></td></tr>`;
+      $('file-count').textContent = 'Error';
+    }
+  }
+
+  /* ─── Upload ─── */
+  let selectedFile = null;
+
+  $('file-input').addEventListener('change', e => {
+    selectedFile = e.target.files[0];
+    if (selectedFile) {
+      $('file-selected-name').style.display = 'block';
+      $('file-selected-name').textContent = `📎 ${selectedFile.name}  (${fmt(selectedFile.size)})`;
+      $('upload-btn').disabled = false;
+    }
+  });
+
+  const dropZone = $('drop-zone');
+  dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+  dropZone.addEventListener('dragleave', ()  => dropZone.classList.remove('dragover'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault(); dropZone.classList.remove('dragover');
+    const file = e.dataTransfer.files[0];
+    if (file) {
+      selectedFile = file;
+      $('file-selected-name').style.display = 'block';
+      $('file-selected-name').textContent = `📎 ${file.name}  (${fmt(file.size)})`;
+      $('upload-btn').disabled = false;
+    }
+  });
+
+  async function uploadFile() {
+    if (!selectedFile) return;
+    const btn = $('upload-btn');
+    btn.disabled = true;
+    btn.innerHTML = '<div class="spinner"></div> Uploading…';
+
+    $('upload-result').style.display = 'none';
+    const pw = $('progress-wrap');
+    const pb = $('progress-bar');
+    const pl = $('progress-label');
+    pw.style.display = 'block';
+    pb.style.width = '10%';
+    pl.textContent = 'Sending to Metadata Server…';
+
+    const form = new FormData();
+    form.append('file', selectedFile);
+
+    try {
+      // Animate progress (we can't get real XHR progress for fetch easily, so simulate)
+      let fakeProgress = 10;
+      const ticker = setInterval(() => {
+        fakeProgress = Math.min(fakeProgress + Math.random() * 8, 85);
+        pb.style.width = fakeProgress + '%';
+        pl.textContent = `Chunking & distributing…  ${fakeProgress.toFixed(0)}%`;
+      }, 300);
+
+      const r = await fetch(baseURL() + '/upload', { method: 'POST', body: form });
+      clearInterval(ticker);
+
+      if (!r.ok) {
+        const errText = await r.text();
+        throw new Error(`Server returned ${r.status}: ${errText}`);
+      }
+
+      const json = await r.json();
+      pb.style.width = '100%';
+      pl.textContent = '✅ Upload complete!';
+
+      $('upload-result').style.display = 'block';
+      $('upload-result-json').textContent = JSON.stringify(json, null, 2);
+      toast(`"${selectedFile.name}" uploaded successfully as File #${json.id}`, 'success');
+
+      setTimeout(() => { pw.style.display = 'none'; }, 2000);
+      loadFiles();
+    } catch(e) {
+      pb.style.width = '100%';
+      pb.style.background = 'var(--red)';
+      pl.textContent = `❌ ${e.message}`;
+      toast(e.message, 'error', 5000);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = '<span>⬆</span> Upload to DFS';
+    }
+  }
+
+  function clearUpload() {
+    selectedFile = null;
+    $('file-input').value = '';
+    $('file-selected-name').style.display = 'none';
+    $('upload-btn').disabled = true;
+    $('progress-wrap').style.display = 'none';
+    $('upload-result').style.display = 'none';
+    $('progress-bar').style.background = 'linear-gradient(90deg, var(--accent), var(--accent2))';
+  }
+
+  /* ─── Download ─── */
+  async function downloadById(id, filename) {
+    toast(`Fetching file #${id} from DFS…`, 'info');
+    try {
+      const r = await fetch(`${baseURL()}/download/${id}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename || `dfs-file-${id}`;
+      a.click(); URL.revokeObjectURL(url);
+      toast(`"${filename || 'file'}" downloaded successfully`, 'success');
+    } catch(e) {
+      toast(`Download failed: ${e.message}`, 'error', 5000);
+    }
+  }
+
+  async function downloadFile() {
+    const id = $('download-id').value;
+    if (!id) { toast('Enter a file ID first', 'error'); return; }
+    await downloadById(Number(id), `dfs-file-${id}`);
+  }
+
+  /* ─── Inspect (chunk map) ─── */
+  async function inspectFile(id) {
+    try {
+      const files = await fetch(baseURL() + '/files').then(r => r.json());
+      const f = files.find(x => x.id == id);
+      if (!f) { toast('File not found', 'error'); return; }
+      toast(`File #${id}: ${f.chunks ? f.chunks.length : 0} chunks, status ${f.status}`, 'info', 5000);
+    } catch(e) {
+      toast(e.message, 'error');
+    }
+  }
+
+  /* ─── Refresh all ─── */
+  async function refreshAll() {
+    const icon = $('refresh-icon');
+    icon.classList.add('refreshing');
+    await Promise.all([checkServerStatus(), loadNodes(), loadFiles()]);
+    icon.classList.remove('refreshing');
+  }
+
+  /* ─── Init ─── */
+  refreshAll();
+  setInterval(() => { loadNodes(); checkServerStatus(); }, 10000);
+</script>
+</body>
+</html>

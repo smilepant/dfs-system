@@ -1,0 +1,13 @@
+metadata:
+  port: 8000
+  db_path: "./metadata.db"
+  replication_factor: 2
+  etcd_endpoints: ["etcd:2379"]
+
+storage:
+  node_id: "storage-node-1"
+  port: 8081
+  storage_root: "/data"
+  etcd_endpoints: ["etcd:2379"]
+  heartbeat_interval: 5
+  metadata_server_url: "http://metadata-server:8000"
