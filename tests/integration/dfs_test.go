@@ -66,7 +66,7 @@ func TestMetadataRepository(t *testing.T) {
 	gormDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
 	assert.NoError(t, err)
 
-	err = gormDB.AutoMigrate(&model.File{}, &model.Chunk{}, &model.ChunkReplica{}, &model.StorageNode{})
+	err = gormDB.AutoMigrate(model.All()...)
 	assert.NoError(t, err)
 
 	repo := repository.NewRepository(gormDB)

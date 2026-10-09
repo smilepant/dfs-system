@@ -3,6 +3,8 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
@@ -33,6 +35,11 @@ type NodeHealthResult struct {
 	TotalSpace int64  `json:"total_space"`
 	FreeSpace  int64  `json:"free_space"`
 	Error      string `json:"error,omitempty"`
+	// InCluster reports whether the node currently holds a live etcd lease, i.e.
+	// whether uploads, downloads and repair will use it. Nil if etcd could not be queried.
+	InCluster *bool `json:"in_cluster"`
+	// ReplicaCount is the number of chunk replicas the metadata DB places on this node.
+	ReplicaCount int64 `json:"replica_count"`
 }
 
 // NodeDiscoverer lists the storage nodes that are currently alive.
@@ -53,6 +60,9 @@ type MetadataService struct {
 	// not reference yet; deletes hold the write lock while removing chunk data,
 	// so a delete can never remove a chunk an in-flight upload is about to use.
 	mutationMu sync.RWMutex
+
+	// checking holds the IDs of files with an integrity check in progress.
+	checking sync.Map
 }
 
 // NewMetadataService creates a new metadata server service.
@@ -178,11 +188,12 @@ func (s *MetadataService) UploadFile(ctx context.Context, filename string, r io.
 	s.logger.Info("Starting file upload", zap.String("filename", filename))
 
 	activeNodes, err := s.GetActiveNodes(ctx)
-	if err != nil {
-		return nil, err
+	if err == nil && len(activeNodes) == 0 {
+		err = errors.ErrNoActiveNodes
 	}
-	if len(activeNodes) == 0 {
-		return nil, errors.ErrNoActiveNodes
+	if err != nil {
+		s.recordOperation(model.OpUpload, 0, filename, model.OpFailed, err.Error(), 0)
+		return nil, err
 	}
 
 	want := s.repFactor
@@ -205,6 +216,7 @@ func (s *MetadataService) UploadFile(ctx context.Context, filename string, r io.
 		return nil, fmt.Errorf("failed to create file record in DB: %w", err)
 	}
 
+	fileHash := sha256.New()
 	place := newPlacement(activeNodes)
 	reader := chunking.NewReader(r, chunking.DefaultChunkSize)
 	var uploadErr error
@@ -219,6 +231,7 @@ func (s *MetadataService) UploadFile(ctx context.Context, filename string, r io.
 			break
 		}
 
+		fileHash.Write(data)
 		hash := hashing.ComputeSHA256(data)
 		size := int64(len(data))
 		s.logger.Debug("Processing chunk", zap.Int("sequence", seq), zap.String("hash", hash), zap.Int64("size", size))
@@ -243,15 +256,21 @@ func (s *MetadataService) UploadFile(ctx context.Context, filename string, r io.
 	dbFile.Status = model.FileStatusActive
 	if uploadErr != nil {
 		dbFile.Status = model.FileStatusFailed
+	} else {
+		dbFile.Checksum = hex.EncodeToString(fileHash.Sum(nil))
 	}
 	if err := s.repo.SaveFileWithAssociations(dbFile); err != nil {
 		_ = s.repo.UpdateFileStatus(dbFile.ID, model.FileStatusFailed)
+		s.recordOperation(model.OpUpload, dbFile.ID, filename, model.OpFailed, "failed to save file metadata", dbFile.SizeBytes)
 		return nil, fmt.Errorf("failed to save file chunks in DB: %w", err)
 	}
 	if uploadErr != nil {
 		s.logger.Error("File upload failed", zap.Uint("file_id", dbFile.ID), zap.Error(uploadErr))
+		s.recordOperation(model.OpUpload, dbFile.ID, filename, model.OpFailed, uploadErr.Error(), dbFile.SizeBytes)
 		return nil, uploadErr
 	}
+	s.recordOperation(model.OpUpload, dbFile.ID, filename, model.OpSuccess,
+		fmt.Sprintf("%d chunk(s), %d replica(s) each", len(dbFile.Chunks), want), dbFile.SizeBytes)
 
 	s.logger.Info("File upload completed successfully",
 		zap.Uint("file_id", dbFile.ID),
@@ -294,11 +313,18 @@ func (s *MetadataService) DownloadFile(ctx context.Context, fileID uint, w io.Wr
 // writes them to w in order. The next few chunks are prefetched while the current
 // one is written, so memory use stays bounded regardless of file size. Nothing is
 // written to w if the first chunk cannot be fetched.
-func (s *MetadataService) StreamFile(ctx context.Context, file *model.File, w io.Writer) error {
+func (s *MetadataService) StreamFile(ctx context.Context, file *model.File, w io.Writer) (err error) {
 	if file.Status != model.FileStatusActive {
 		return errors.ErrFileNotReady
 	}
 	s.logger.Info("Starting file download", zap.Uint("file_id", file.ID))
+	defer func() {
+		if err != nil {
+			s.recordOperation(model.OpDownload, file.ID, file.Filename, model.OpFailed, err.Error(), file.SizeBytes)
+		} else {
+			s.recordOperation(model.OpDownload, file.ID, file.Filename, model.OpSuccess, "", file.SizeBytes)
+		}
+	}()
 
 	activeNodeMap, _, err := s.liveAddresses(ctx)
 	if err != nil {
@@ -381,6 +407,11 @@ func (s *MetadataService) fetchChunkFromReplicas(ctx context.Context, chunk mode
 	return nil, fmt.Errorf("no replica nodes available to fetch chunk")
 }
 
+// nodeStatusError is returned when a storage node answers with an unexpected HTTP status.
+type nodeStatusError struct{ code int }
+
+func (e *nodeStatusError) Error() string { return fmt.Sprintf("node returned status %d", e.code) }
+
 func (s *MetadataService) downloadChunkFromNode(ctx context.Context, address, hash string) ([]byte, error) {
 	url := fmt.Sprintf("http://%s/chunk/%s", address, hash)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -398,7 +429,7 @@ func (s *MetadataService) downloadChunkFromNode(ctx context.Context, address, ha
 		return nil, errors.ErrChunkNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("node returned status %d", resp.StatusCode)
+		return nil, &nodeStatusError{resp.StatusCode}
 	}
 
 	return io.ReadAll(io.LimitReader(resp.Body, chunking.DefaultChunkSize+1))
@@ -433,6 +464,7 @@ func (s *MetadataService) DeleteFile(ctx context.Context, fileID uint) error {
 		return err
 	}
 	s.logger.Info("File metadata deleted", zap.Uint("file_id", fileID), zap.String("filename", file.Filename))
+	s.recordOperation(model.OpDelete, fileID, file.Filename, model.OpSuccess, "", file.SizeBytes)
 
 	activeNodeMap, _, err := s.liveAddresses(ctx)
 	if err != nil {
@@ -576,6 +608,15 @@ func (s *MetadataService) GetAllNodeHealth(ctx context.Context) []NodeHealthResu
 		return []NodeHealthResult{}
 	}
 
+	replicaCounts, err := s.repo.CountReplicasByNode()
+	if err != nil {
+		s.logger.Warn("Could not count replicas per node", zap.Error(err))
+	}
+	live, _, liveErr := s.liveAddresses(ctx)
+	if liveErr != nil {
+		s.logger.Warn("Could not query etcd for live nodes", zap.Error(liveErr))
+	}
+
 	results := make([]NodeHealthResult, len(nodes))
 	var wg sync.WaitGroup
 	healthClient := &http.Client{Timeout: 2 * time.Second}
@@ -585,8 +626,13 @@ func (s *MetadataService) GetAllNodeHealth(ctx context.Context) []NodeHealthResu
 		go func(idx int, n model.StorageNode) {
 			defer wg.Done()
 			result := NodeHealthResult{
-				NodeID:  n.NodeID,
-				Address: n.Address,
+				NodeID:       n.NodeID,
+				Address:      n.Address,
+				ReplicaCount: replicaCounts[n.NodeID],
+			}
+			if liveErr == nil {
+				_, ok := live[n.NodeID]
+				result.InCluster = &ok
 			}
 			defer func() { results[idx] = result }()
 

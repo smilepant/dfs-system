@@ -106,7 +106,7 @@ func main() {
 	if err := gormDB.Exec("PRAGMA journal_mode=WAL").Error; err != nil {
 		log.Warn("Could not enable WAL mode", zap.Error(err))
 	}
-	if err := gormDB.AutoMigrate(&model.File{}, &model.Chunk{}, &model.ChunkReplica{}, &model.StorageNode{}); err != nil {
+	if err := gormDB.AutoMigrate(model.All()...); err != nil {
 		log.Fatal("Database migration failed", zap.Error(err))
 	}
 	log.Info("Database migrated")
@@ -154,6 +154,12 @@ func main() {
 	r.DELETE("/files/:fileId", h.DeleteFile)
 	r.POST("/nodes/register", h.RegisterNode)
 	r.GET("/nodes/health", h.NodesHealth)
+	r.POST("/files/:fileId/verify", h.VerifyFile)
+	r.POST("/files/:fileId/repair", h.RepairFile)
+	r.GET("/files/:fileId/integrity", h.FileIntegrity)
+	r.GET("/integrity", h.ListIntegrity)
+	r.GET("/stats", h.Stats)
+	r.GET("/operations", h.ListOperations)
 
 	// Serve web dashboard — available at /app/
 	r.Static("/app", *webDir)

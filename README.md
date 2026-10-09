@@ -13,13 +13,16 @@ Client
 Metadata Server (Gin + GORM + SQLite)
   │  ├── Streams the uploaded file in 4 MB chunks (one chunk in memory at a time)
   │  ├── Computes SHA-256 per chunk (pkg/hashing) — the chunk's content address
+  │  ├── Computes SHA-256 of the whole file while streaming (stored as its checksum)
   │  ├── Discovers live nodes (and their free space) via etcd
   │  ├── Places each replica on the node with most projected free space,
   │  │   falling back to another node if a replica write fails
   │  ├── Stores file/chunk/replica metadata in SQLite via GORM
   │  ├── On download: fetches chunks (with prefetch), verifies hash, streams file
   │  ├── On delete: removes chunk data no other file still references
-  │  └── Background repair: re-replicates chunks whose holders went offline
+  │  ├── Background repair: re-replicates chunks whose holders went offline
+  │  ├── Integrity checks: re-reads every replica on demand and re-verifies hashes
+  │  └── Serves the web console at /app/ (web/)
   │
   ├── etcd (node registry, lease-based heartbeats + free-space updates)
   │
@@ -54,6 +57,7 @@ dfs-system/
 │   │   ├── model/models.go       # GORM models (File, Chunk, Replica, Node)
 │   │   ├── repository/repository.go # GORM DB queries
 │   │   ├── service/service.go    # Business logic (upload/download)
+│   │   ├── service/integrity.go  # Integrity checks, cluster stats, activity log
 │   │   └── metadata.go
 │   │
 │   └── storage/
@@ -81,6 +85,11 @@ dfs-system/
 │
 ├── tests/
 │   └── integration/dfs_test.go   # Integration tests (etcd + GORM)
+│
+├── web/                          # Web console (plain HTML/CSS/JS, no build step)
+│   ├── index.html
+│   ├── app.css
+│   └── app.js
 │
 ├── go.mod
 └── README.md
@@ -114,10 +123,18 @@ dfs-system/
 | GET    | `/files/:fileId`       | File metadata with chunk/replica map     |
 | DELETE | `/files/:fileId`       | Delete a file and its unshared chunks    |
 | POST   | `/nodes/register`      | Register a storage node in the DB        |
-| GET    | `/nodes/health`        | Health of every registered storage node  |
+| GET    | `/nodes/health`        | Health, etcd membership and replica count of every registered node |
+| POST   | `/files/:fileId/verify`| Run an integrity check on a file (see below) |
+| POST   | `/files/:fileId/repair`| Restore damaged/missing replicas from intact ones, then re-check (see below) |
+| GET    | `/files/:fileId/integrity` | Latest check with per-replica results, plus the last 10 checks |
+| GET    | `/integrity`           | Every file with its checksum and latest check result |
+| GET    | `/stats`               | File counts, stored bytes, under-replicated chunks, integrity summary |
+| GET    | `/operations`          | Activity log, newest first (`?type=` UPLOAD, DOWNLOAD, DELETE, VERIFY or REPAIR; `?limit=1..500`) |
 
-Status codes: `404` unknown file, `409` file not `ACTIVE` (e.g. a `FAILED` upload),
-`503` not enough live nodes / replicas to serve the request.
+Status codes: `404` unknown file, `409` file not `ACTIVE` (e.g. a `FAILED` upload) or an
+integrity check or repair for that file already running, `503` not enough live nodes / replicas to serve the request.
+
+`GET /download/:fileId` also returns the file's SHA-256 in an `X-Checksum-SHA256` header.
 
 ### Storage Node (`:8081`, `:8082`, `:8083`)
 
@@ -159,6 +176,25 @@ curl -X POST http://localhost:8000/upload \
 curl http://localhost:8000/download/1 --output downloaded.txt
 ```
 
+### Verify a file's integrity
+```bash
+curl -X POST http://localhost:8000/files/1/verify
+```
+**Response (abridged):**
+```json
+{
+  "status": "DEGRADED",
+  "expected_checksum": "da727c7d…",
+  "computed_checksum": "da727c7d…",
+  "replicas_ok": 5, "replicas_total": 6,
+  "message": "File content is intact; 1 of 6 replica(s) failed verification; …",
+  "replicas": [
+    { "chunk_sequence": 1, "node_id": "storage-node-3", "status": "CORRUPT",
+      "detail": "Content SHA-256 is d121be310300…, expected e9be242d8971…." }
+  ]
+}
+```
+
 ### List files
 ```bash
 curl http://localhost:8000/files
@@ -187,6 +223,78 @@ curl -X POST http://localhost:8000/nodes/register \
 
 ---
 
+## Web Console
+
+Open **http://localhost:8000/app/** (or `http://localhost:8000/`, which redirects there). It is served
+by the metadata server and only shows data returned by the API above.
+
+| Page          | What it shows / does |
+|---------------|----------------------|
+| Overview      | Active files, stored bytes, chunk/replica counts, node disk usage, under-replicated chunks, integrity summary, recent files and activity |
+| Files         | Search, filter by status/integrity, sort; upload (real upload progress, drag & drop), download, verify, delete (with confirmation); per-file chunk map showing which node holds each replica |
+| Integrity     | Each file's SHA-256 and latest check result; verify one file or all active files; **Repair replicas** for files whose last check found problems; per-replica report, repair actions and check history |
+| Storage nodes | `/health` reachability, etcd lease status, replicas stored, disk usage per node |
+| Activity      | Log of uploads, downloads, deletes, integrity checks and repairs |
+
+Downloads made through the console are re-hashed in the browser (files up to 512 MB) and compared
+with the `X-Checksum-SHA256` header, so the end-to-end transfer is verified too.
+
+If the console is opened from a different origin (e.g. as a local file), use **Change** in the sidebar
+to point it at the metadata server.
+
+---
+
+## File Integrity Checks
+
+Each upload records a SHA-256 for every chunk (its content address) and for the whole file.
+`POST /files/:id/verify` (or **Verify** in the console):
+
+1. Reads **every replica of every chunk** back from its storage node and hashes it.
+2. Classifies each replica: `OK`, `CORRUPT` (hash differs), `MISSING` (node up, chunk absent),
+   `OFFLINE` (node has no live etcd lease) or `ERROR` (node unreachable / server error).
+3. Reassembles the file from intact replicas and compares its SHA-256 with the recorded file checksum.
+4. Stores the result (the last 20 checks per file are kept) and records it in the activity log.
+
+| Result        | Meaning |
+|---------------|---------|
+| `VERIFIED`    | Every replica is intact, every chunk meets the replication target, file checksum matches |
+| `DEGRADED`    | File content is intact, but some replicas failed or a chunk has fewer intact replicas than the target |
+| `CORRUPT`     | A chunk has no intact replica and corrupt data was found, or the reassembled file doesn't match its checksum |
+| `UNAVAILABLE` | A chunk has no intact replica on a reachable node (missing/offline, no corruption seen) |
+| `FAILED`      | The check could not run (e.g. etcd unreachable) |
+
+A `VERIFIED` result confirms the stored content at the time of the check; it says nothing about
+whether nodes will stay up. Files uploaded before file checksums existed show "Not recorded"; their first
+check that finds every chunk intact computes the checksum from the hash-verified chunks and saves it.
+
+### Repairing a file
+
+When a check returns `DEGRADED`, `CORRUPT` or `UNAVAILABLE`, the console shows **Repair replicas**
+(Integrity page, integrity report, and file details). `POST /files/:id/repair`:
+
+1. Re-reads every replica and finds an intact copy of each chunk (SHA-256 verified).
+2. Rewrites `CORRUPT` and `MISSING` replicas in place from that copy. Storage nodes verify the hash on write
+   and replace an existing copy whose content no longer matches.
+3. If a chunk still has fewer intact replicas than the replication target, places new replicas on other live nodes.
+4. Runs a new integrity check, stores it, and logs a `REPAIR` entry. The response lists every action
+   (`REWRITTEN`, `ADDED`, `FAILED`, `SKIPPED`).
+
+What repair cannot do:
+- **Restore a chunk that has no intact replica anywhere.** It is reported as unrecoverable and the file stays `CORRUPT`/`UNAVAILABLE`.
+  Bad data is never copied.
+- **Check replicas on offline nodes.** They are left in place (the node may come back with good data). Repair still adds
+  replacements so redundancy is restored, but the result stays `DEGRADED` until the node returns or is removed.
+- **Rewrite a replica on a node that is leased but not answering.** That replica is skipped.
+
+The background repair loop (`repair_interval`) still runs independently and only handles chunks whose holders are offline.
+
+**Demo:** upload a file larger than 4 MB and verify it (`VERIFIED`). Corrupt one replica on disk, e.g.
+`echo tampered > data/node1/chunk_<hash>` (chunk hashes and their nodes are listed in the file's chunk map),
+and verify again (`DEGRADED`, with the corrupt replica named). Click **Repair replicas**: the replica is rewritten and
+the file returns to `VERIFIED`. Stop a storage node to see `OFFLINE` replicas.
+
+---
+
 ## Running with Docker Compose
 
 ### Prerequisites
@@ -194,9 +302,12 @@ curl -X POST http://localhost:8000/nodes/register \
 
 ### Start the full cluster
 ```bash
-cd docker/
-docker-compose up --build
+./scripts/start.sh        # Linux/macOS
+.\scripts\start.ps1       # Windows PowerShell
 ```
+The scripts cross-compile `docker/metadata-server-linux` and `docker/storage-node-linux` from the current
+source before running `docker compose up --build`. Running `docker compose` directly reuses whatever
+binaries are already in `docker/`, which may be older than the source.
 
 This starts:
 - **etcd** on port `2379`
@@ -280,8 +391,8 @@ go test -v ./...
 |---------------------------------|------------------------------------|
 | `pkg/chunking`                  | Split + Merge round-trip, streaming reader edge cases |
 | `pkg/hashing`                   | SHA-256 correctness, determinism, chunk-ID validation |
-| `internal/storage/service`      | Chunk save/read/delete, hash verification, path traversal, capacity, restart recovery |
-| `internal/metadata/service`     | End-to-end upload/download against in-process storage nodes: placement spread, write failover, node loss, corruption, re-replication, dedup-safe delete |
+| `internal/storage/service`      | Chunk save/read/delete, hash verification, path traversal, capacity, restart recovery, replacing a corrupt copy |
+| `internal/metadata/service`     | End-to-end upload/download against in-process storage nodes: placement spread, write failover, node loss, corruption, re-replication, dedup-safe delete; integrity checks (healthy, corrupt, missing, offline, unreachable, checksum mismatch, checksum backfill, under-replication); repair (same-size corruption, missing, offline holder, under-replication, unrecoverable chunk); stats and activity log |
 | `tests/integration`             | GORM repo + etcd (skipped if down) |
 
 ---
@@ -325,4 +436,8 @@ storage nodes also accept `-advertise` and `-capacity`; the metadata server acce
 ### Known limitations
 - The Metadata Server (SQLite) is a single point of failure.
 - Chunk data on a node that is offline when its file is deleted is left behind (orphaned) — there is no orphan GC yet.
-- There is no authentication; don't expose the ports publicly.
+- There is no authentication; don't expose the ports publicly. Every API caller (and the console) can read, verify and delete every file.
+- Damaged replicas are only repaired when someone runs **Repair** (or `POST /files/:id/repair`). The background
+  repair loop only re-replicates chunks whose holders are offline, and nothing verifies stored data on a schedule.
+- If a chunk becomes unreadable after a download has started, the transfer is cut short (headers are already sent),
+  so clients see a truncated download rather than an error status.

@@ -81,8 +81,12 @@ func (s *StorageService) SaveChunk(hash string, data []byte) error {
 	if hashing.ComputeSHA256(data) != hash {
 		return errors.ErrChunkCorrupted
 	}
+	// Content-addressed: an intact copy already on disk makes this a no-op. A
+	// copy whose content no longer matches (corrupted on disk) is overwritten.
 	if info, err := s.fs.Stat(filePath); err == nil && info.Size() == int64(len(data)) {
-		return nil
+		if existing, err := afero.ReadFile(s.fs, filePath); err == nil && hashing.ComputeSHA256(existing) == hash {
+			return nil
+		}
 	}
 
 	tmp, err := afero.TempFile(s.fs, s.storageRoot, tmpPrefix+hash+"_")

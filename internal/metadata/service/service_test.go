@@ -63,6 +63,7 @@ type testNode struct {
 type cluster struct {
 	svc   *MetadataService
 	repo  *repository.Repository
+	db    *gorm.DB
 	disc  *fakeDiscoverer
 	nodes map[string]*testNode
 }
@@ -75,11 +76,12 @@ func newCluster(t *testing.T, nodeCount, repFactor int, failing ...string) *clus
 	require.NoError(t, err)
 	sqlDB, _ := db.DB()
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, db.AutoMigrate(&model.File{}, &model.Chunk{}, &model.ChunkReplica{}, &model.StorageNode{}))
+	require.NoError(t, db.AutoMigrate(model.All()...))
 	repo := repository.NewRepository(db)
 
 	c := &cluster{
 		repo:  repo,
+		db:    db,
 		disc:  &fakeDiscoverer{nodes: map[string]common.StorageNodeInfo{}, down: map[string]bool{}},
 		nodes: map[string]*testNode{},
 	}

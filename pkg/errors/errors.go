@@ -12,4 +12,5 @@ var (
 	ErrInsufficientSpace = errors.New("insufficient storage space on node")
 	ErrNoActiveNodes     = errors.New("no active storage nodes available")
 	ErrRepFactorUnmet    = errors.New("could not satisfy replication factor")
+	ErrCheckInProgress   = errors.New("an integrity check or repair for this file is already running")
 )

@@ -1,10 +1,13 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"mime"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"dfs-system/internal/common"
 	"dfs-system/internal/metadata/model"
@@ -33,7 +36,8 @@ func statusFor(err error) int {
 	switch {
 	case errors.Is(err, dfserrors.ErrFileNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, dfserrors.ErrFileNotReady):
+	case errors.Is(err, dfserrors.ErrFileNotReady),
+		errors.Is(err, dfserrors.ErrCheckInProgress):
 		return http.StatusConflict
 	case errors.Is(err, dfserrors.ErrNoActiveNodes),
 		errors.Is(err, dfserrors.ErrRepFactorUnmet),
@@ -102,6 +106,9 @@ func (h *MetadataHandler) Download(c *gin.Context) {
 	header.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": fileMeta.Filename}))
 	header.Set("Content-Type", "application/octet-stream")
 	header.Set("Content-Length", strconv.FormatInt(fileMeta.SizeBytes, 10))
+	if fileMeta.Checksum != "" {
+		header.Set("X-Checksum-SHA256", fileMeta.Checksum)
+	}
 
 	err = h.svc.StreamFile(c.Request.Context(), fileMeta, c.Writer)
 	if err == nil {
@@ -113,6 +120,7 @@ func (h *MetadataHandler) Download(c *gin.Context) {
 		header.Del("Content-Disposition")
 		header.Del("Content-Length")
 		header.Del("Content-Type")
+		header.Del("X-Checksum-SHA256")
 		c.JSON(statusFor(err), gin.H{"error": err.Error()})
 	}
 	// Otherwise the body is shorter than Content-Length; net/http closes the
@@ -192,4 +200,118 @@ func (h *MetadataHandler) RegisterNode(c *gin.Context) {
 func (h *MetadataHandler) NodesHealth(c *gin.Context) {
 	results := h.svc.GetAllNodeHealth(c.Request.Context())
 	c.JSON(http.StatusOK, results)
+}
+
+// verifyTimeout bounds a single integrity check.
+const verifyTimeout = 10 * time.Minute
+
+// VerifyFile handles POST /files/:fileId/verify. The check keeps running if the
+// client disconnects, so its result is always recorded.
+func (h *MetadataHandler) VerifyFile(c *gin.Context) {
+	fileID, ok := parseFileID(c)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), verifyTimeout)
+	defer cancel()
+
+	check, err := h.svc.VerifyFile(ctx, fileID)
+	if err != nil {
+		if statusFor(err) == http.StatusInternalServerError {
+			h.logger.Error("Integrity check failed", zap.Uint("file_id", fileID), zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "integrity check could not be completed"})
+			return
+		}
+		c.JSON(statusFor(err), gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, check)
+}
+
+// RepairFile handles POST /files/:fileId/repair. Like VerifyFile, it keeps
+// running if the client disconnects so a half-finished repair is never abandoned.
+func (h *MetadataHandler) RepairFile(c *gin.Context) {
+	fileID, ok := parseFileID(c)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), verifyTimeout)
+	defer cancel()
+
+	result, err := h.svc.RepairFile(ctx, fileID)
+	if err != nil {
+		if statusFor(err) == http.StatusInternalServerError {
+			h.logger.Error("Repair failed", zap.Uint("file_id", fileID), zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "repair could not be completed"})
+			return
+		}
+		c.JSON(statusFor(err), gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// FileIntegrity handles GET /files/:fileId/integrity
+func (h *MetadataHandler) FileIntegrity(c *gin.Context) {
+	fileID, ok := parseFileID(c)
+	if !ok {
+		return
+	}
+	report, err := h.svc.GetIntegrityReport(fileID)
+	if err != nil {
+		c.JSON(statusFor(err), gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, report)
+}
+
+// ListIntegrity handles GET /integrity
+func (h *MetadataHandler) ListIntegrity(c *gin.Context) {
+	files, err := h.svc.ListIntegrity()
+	if err != nil {
+		h.logger.Error("Listing integrity failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load integrity status"})
+		return
+	}
+	c.JSON(http.StatusOK, files)
+}
+
+// Stats handles GET /stats
+func (h *MetadataHandler) Stats(c *gin.Context) {
+	stats, err := h.svc.Stats(c.Request.Context())
+	if err != nil {
+		h.logger.Error("Computing stats failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to compute cluster stats"})
+		return
+	}
+	c.JSON(http.StatusOK, stats)
+}
+
+var operationTypes = map[string]bool{
+	model.OpUpload: true, model.OpDownload: true, model.OpDelete: true, model.OpVerify: true, model.OpRepair: true,
+}
+
+// ListOperations handles GET /operations?type=UPLOAD&limit=50
+func (h *MetadataHandler) ListOperations(c *gin.Context) {
+	opType := strings.ToUpper(c.Query("type"))
+	if opType != "" && !operationTypes[opType] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "type must be one of UPLOAD, DOWNLOAD, DELETE, VERIFY, REPAIR"})
+		return
+	}
+	limit := 50
+	if v := c.Query("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 500 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "limit must be between 1 and 500"})
+			return
+		}
+		limit = n
+	}
+	ops, err := h.svc.ListOperations(opType, limit)
+	if err != nil {
+		h.logger.Error("Listing operations failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load activity"})
+		return
+	}
+	c.JSON(http.StatusOK, ops)
 }

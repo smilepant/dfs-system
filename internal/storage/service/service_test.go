@@ -92,3 +92,25 @@ func TestStorageServiceCapacityAndRecovery(t *testing.T) {
 	exists, _ := afero.Exists(fs, root+"/tmp_leftover")
 	assert.False(t, exists)
 }
+
+func TestSaveChunkReplacesCorruptCopyOfSameSize(t *testing.T) {
+	fs := afero.NewMemMapFs()
+	store, err := NewStorageService(fs, "/data", 0)
+	assert.NoError(t, err)
+
+	data := []byte("original chunk content")
+	hash := hashing.ComputeSHA256(data)
+	assert.NoError(t, store.SaveChunk(hash, data))
+
+	// Flip the content on disk without changing its size.
+	corrupt := []byte("ORIGINAL CHUNK CONTENT")
+	assert.NoError(t, afero.WriteFile(fs, "/data/chunk_"+hash, corrupt, 0644))
+
+	assert.NoError(t, store.SaveChunk(hash, data))
+	got, err := store.GetChunk(hash)
+	assert.NoError(t, err)
+	assert.Equal(t, data, got)
+
+	_, free, _ := store.GetStats()
+	assert.Equal(t, DefaultCapacity-int64(len(data)), free, "overwrite must not double-count usage")
+}
