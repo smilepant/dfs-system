@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,7 +13,6 @@ import (
 	"time"
 
 	"dfs-system/internal/common"
-	"dfs-system/internal/coordinator"
 	"dfs-system/internal/metadata/model"
 	"dfs-system/internal/metadata/repository"
 	"dfs-system/pkg/chunking"
@@ -21,6 +21,9 @@ import (
 
 	"go.uber.org/zap"
 )
+
+// downloadPrefetch is how many chunks may be fetched ahead of the one being written.
+const downloadPrefetch = 2
 
 // NodeHealthResult is the aggregated health status for one storage node.
 type NodeHealthResult struct {
@@ -32,22 +35,34 @@ type NodeHealthResult struct {
 	Error      string `json:"error,omitempty"`
 }
 
+// NodeDiscoverer lists the storage nodes that are currently alive.
+// It is satisfied by *coordinator.Coordinator (etcd) and by test fakes.
+type NodeDiscoverer interface {
+	DiscoverNodes(ctx context.Context) ([]common.StorageNodeInfo, error)
+}
+
 type MetadataService struct {
 	repo       *repository.Repository
-	etcdCoord  *coordinator.Coordinator
+	discoverer NodeDiscoverer
 	repFactor  int
 	httpClient *http.Client
 	logger     *zap.Logger
+
+	// Chunks are content-addressed and shared between files. Uploads and
+	// repairs hold the read lock while they place chunk data that the DB does
+	// not reference yet; deletes hold the write lock while removing chunk data,
+	// so a delete can never remove a chunk an in-flight upload is about to use.
+	mutationMu sync.RWMutex
 }
 
 // NewMetadataService creates a new metadata server service.
-func NewMetadataService(repo *repository.Repository, etcdCoord *coordinator.Coordinator, repFactor int, logger *zap.Logger) *MetadataService {
+func NewMetadataService(repo *repository.Repository, discoverer NodeDiscoverer, repFactor int, logger *zap.Logger) *MetadataService {
 	return &MetadataService{
-		repo:      repo,
-		etcdCoord: etcdCoord,
-		repFactor: repFactor,
+		repo:       repo,
+		discoverer: discoverer,
+		repFactor:  repFactor,
 		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: 30 * time.Second,
 		},
 		logger: logger,
 	}
@@ -55,16 +70,112 @@ func NewMetadataService(repo *repository.Repository, etcdCoord *coordinator.Coor
 
 // GetActiveNodes retrieves active storage nodes from the etcd registry.
 func (s *MetadataService) GetActiveNodes(ctx context.Context) ([]common.StorageNodeInfo, error) {
-	nodes, err := s.etcdCoord.DiscoverNodes(ctx)
+	nodes, err := s.discoverer.DiscoverNodes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover active nodes in etcd: %w", err)
 	}
 	return nodes, nil
 }
 
-// UploadFile splits a file into 4MB chunks, distributes replicas to active storage nodes, and registers metadata in GORM.
-func (s *MetadataService) UploadFile(ctx context.Context, filename string, r io.Reader, sizeBytes int64) (*model.File, error) {
-	s.logger.Info("Starting file upload", zap.String("filename", filename), zap.Int64("size", sizeBytes))
+func (s *MetadataService) liveAddresses(ctx context.Context) (map[string]string, []common.StorageNodeInfo, error) {
+	nodes, err := s.GetActiveNodes(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	addrs := make(map[string]string, len(nodes))
+	for _, n := range nodes {
+		addrs[n.NodeID] = n.Address
+	}
+	return addrs, nodes, nil
+}
+
+// placement tracks projected free space per node while chunks are being placed,
+// so consecutive chunks spread across nodes instead of all landing on whichever
+// nodes had the most free space at the start.
+type placement struct {
+	nodes []common.StorageNodeInfo
+}
+
+func newPlacement(nodes []common.StorageNodeInfo) *placement {
+	return &placement{nodes: append([]common.StorageNodeInfo(nil), nodes...)}
+}
+
+// candidates returns nodes with room for size bytes, excluding the given node IDs,
+// ordered by most projected free space first.
+func (p *placement) candidates(size int64, exclude map[string]bool) []common.StorageNodeInfo {
+	out := make([]common.StorageNodeInfo, 0, len(p.nodes))
+	for _, n := range p.nodes {
+		if exclude[n.NodeID] || n.FreeSpace < size {
+			continue
+		}
+		out = append(out, n)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].FreeSpace != out[j].FreeSpace {
+			return out[i].FreeSpace > out[j].FreeSpace
+		}
+		return out[i].NodeID < out[j].NodeID
+	})
+	return out
+}
+
+func (p *placement) record(replicas []model.ChunkReplica, size int64) {
+	for _, r := range replicas {
+		for i := range p.nodes {
+			if p.nodes[i].NodeID == r.NodeID {
+				p.nodes[i].FreeSpace -= size
+			}
+		}
+	}
+}
+
+// replicateChunk stores data on up to `want` distinct candidate nodes. Nodes are
+// tried in order; when one fails, the next candidate takes its place. It returns
+// every replica that was successfully written, plus ErrRepFactorUnmet if fewer
+// than `want` succeeded.
+func (s *MetadataService) replicateChunk(ctx context.Context, hash string, data []byte, candidates []common.StorageNodeInfo, want int) ([]model.ChunkReplica, error) {
+	replicas := make([]model.ChunkReplica, 0, want)
+	next := 0
+	for len(replicas) < want && next < len(candidates) {
+		batch := candidates[next:min(next+want-len(replicas), len(candidates))]
+		next += len(batch)
+
+		errs := make([]error, len(batch))
+		var wg sync.WaitGroup
+		for i, node := range batch {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs[i] = s.uploadChunkToNode(ctx, node.Address, hash, data)
+			}()
+		}
+		wg.Wait()
+
+		for i, err := range errs {
+			if err != nil {
+				s.logger.Warn("Failed to upload chunk to storage node, trying another",
+					zap.String("node_id", batch[i].NodeID),
+					zap.String("address", batch[i].Address),
+					zap.String("hash", hash),
+					zap.Error(err),
+				)
+				continue
+			}
+			replicas = append(replicas, model.ChunkReplica{NodeID: batch[i].NodeID})
+		}
+	}
+	if len(replicas) < want {
+		return replicas, fmt.Errorf("%w: stored %d of %d replicas", errors.ErrRepFactorUnmet, len(replicas), want)
+	}
+	return replicas, nil
+}
+
+// UploadFile streams r in fixed-size chunks, replicates each chunk to active
+// storage nodes, and records metadata. Only one chunk is held in memory at a time.
+// If the upload fails part-way, the file is kept with status FAILED together with
+// the replicas that were written, so deleting it reclaims that space.
+func (s *MetadataService) UploadFile(ctx context.Context, filename string, r io.Reader) (*model.File, error) {
+	s.logger.Info("Starting file upload", zap.String("filename", filename))
 
 	activeNodes, err := s.GetActiveNodes(ctx)
 	if err != nil {
@@ -74,105 +185,85 @@ func (s *MetadataService) UploadFile(ctx context.Context, filename string, r io.
 		return nil, errors.ErrNoActiveNodes
 	}
 
-	actualRepFactor := s.repFactor
-	if len(activeNodes) < actualRepFactor {
+	want := s.repFactor
+	if len(activeNodes) < want {
 		s.logger.Warn("Active nodes count is less than target replication factor",
 			zap.Int("active_nodes", len(activeNodes)),
 			zap.Int("target_rep_factor", s.repFactor),
 		)
-		actualRepFactor = len(activeNodes)
+		want = len(activeNodes)
 	}
 
-	chunkDataList, err := chunking.Split(r, chunking.DefaultChunkSize)
-	if err != nil {
-		return nil, fmt.Errorf("failed to split file: %w", err)
-	}
+	s.mutationMu.RLock()
+	defer s.mutationMu.RUnlock()
 
 	dbFile := &model.File{
-		Filename:  filename,
-		SizeBytes: sizeBytes,
-		Status:    "PENDING",
+		Filename: filename,
+		Status:   model.FileStatusPending,
 	}
 	if err := s.repo.CreateFile(dbFile); err != nil {
 		return nil, fmt.Errorf("failed to create file record in DB: %w", err)
 	}
 
-	dbChunks := make([]model.Chunk, len(chunkDataList))
+	place := newPlacement(activeNodes)
+	reader := chunking.NewReader(r, chunking.DefaultChunkSize)
+	var uploadErr error
 
-	for seq, chunkData := range chunkDataList {
-		hash := hashing.ComputeSHA256(chunkData)
-		s.logger.Info("Processing chunk", zap.Int("sequence", seq), zap.String("hash", hash), zap.Int("size", len(chunkData)))
-
-		sort.Slice(activeNodes, func(i, j int) bool {
-			return activeNodes[i].FreeSpace > activeNodes[j].FreeSpace
-		})
-
-		selectedNodes := make([]common.StorageNodeInfo, 0, actualRepFactor)
-		for _, node := range activeNodes {
-			if len(selectedNodes) == actualRepFactor {
-				break
-			}
-			selectedNodes = append(selectedNodes, node)
+	for seq := 0; ; seq++ {
+		data, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			uploadErr = fmt.Errorf("failed to read uploaded file: %w", err)
+			break
 		}
 
-		if len(selectedNodes) < actualRepFactor {
-			s.repo.UpdateFileStatus(dbFile.ID, "FAILED")
-			return nil, errors.ErrRepFactorUnmet
+		hash := hashing.ComputeSHA256(data)
+		size := int64(len(data))
+		s.logger.Debug("Processing chunk", zap.Int("sequence", seq), zap.String("hash", hash), zap.Int64("size", size))
+
+		replicas, err := s.replicateChunk(ctx, hash, data, place.candidates(size, nil), want)
+		place.record(replicas, size)
+		if len(replicas) > 0 {
+			dbFile.Chunks = append(dbFile.Chunks, model.Chunk{
+				Sequence:  seq,
+				Hash:      hash,
+				SizeBytes: size,
+				Replicas:  replicas,
+			})
 		}
-
-		var wg sync.WaitGroup
-		errsChan := make(chan error, len(selectedNodes))
-		replicas := make([]model.ChunkReplica, len(selectedNodes))
-
-		for idx, nodeInfo := range selectedNodes {
-			wg.Add(1)
-			go func(i int, node common.StorageNodeInfo) {
-				defer wg.Done()
-				err := s.uploadChunkToNode(ctx, node.Address, hash, chunkData)
-				if err != nil {
-					s.logger.Error("Failed to upload chunk to storage node",
-						zap.String("node_id", node.NodeID),
-						zap.String("address", node.Address),
-						zap.Error(err),
-					)
-					errsChan <- err
-					return
-				}
-				replicas[i] = model.ChunkReplica{
-					NodeID: node.NodeID,
-				}
-			}(idx, nodeInfo)
-		}
-
-		wg.Wait()
-		close(errsChan)
-
-		if len(errsChan) > 0 {
-			s.repo.UpdateFileStatus(dbFile.ID, "FAILED")
-			return nil, fmt.Errorf("failed to upload chunk sequence %d to all replicas", seq)
-		}
-
-		dbChunks[seq] = model.Chunk{
-			Sequence:  seq,
-			Hash:      hash,
-			SizeBytes: int64(len(chunkData)),
-			Replicas:  replicas,
+		dbFile.SizeBytes += size
+		if err != nil {
+			uploadErr = fmt.Errorf("chunk %d: %w", seq, err)
+			break
 		}
 	}
 
-	dbFile.Chunks = dbChunks
-	dbFile.Status = "ACTIVE"
+	dbFile.Status = model.FileStatusActive
+	if uploadErr != nil {
+		dbFile.Status = model.FileStatusFailed
+	}
 	if err := s.repo.SaveFileWithAssociations(dbFile); err != nil {
+		_ = s.repo.UpdateFileStatus(dbFile.ID, model.FileStatusFailed)
 		return nil, fmt.Errorf("failed to save file chunks in DB: %w", err)
 	}
+	if uploadErr != nil {
+		s.logger.Error("File upload failed", zap.Uint("file_id", dbFile.ID), zap.Error(uploadErr))
+		return nil, uploadErr
+	}
 
-	s.logger.Info("File upload completed successfully", zap.Uint("file_id", dbFile.ID))
+	s.logger.Info("File upload completed successfully",
+		zap.Uint("file_id", dbFile.ID),
+		zap.Int64("size", dbFile.SizeBytes),
+		zap.Int("chunks", len(dbFile.Chunks)),
+	)
 	return dbFile, nil
 }
 
 func (s *MetadataService) uploadChunkToNode(ctx context.Context, address, hash string, data []byte) error {
 	url := fmt.Sprintf("http://%s/chunk/upload?hash=%s", address, hash)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -190,40 +281,70 @@ func (s *MetadataService) uploadChunkToNode(ctx context.Context, address, hash s
 	return nil
 }
 
-// DownloadFile gathers chunks from active replicas, verifies SHA-256 hashes, and writes the stream to target writer.
+// DownloadFile looks up a file and streams its content to w.
 func (s *MetadataService) DownloadFile(ctx context.Context, fileID uint, w io.Writer) error {
-	s.logger.Info("Starting file download", zap.Uint("file_id", fileID))
-
 	file, err := s.repo.GetFile(fileID)
-	if err != nil {
-		return errors.ErrFileNotFound
-	}
-
-	activeNodes, err := s.GetActiveNodes(ctx)
 	if err != nil {
 		return err
 	}
-	activeNodeMap := make(map[string]string)
-	for _, n := range activeNodes {
-		activeNodeMap[n.NodeID] = n.Address
+	return s.StreamFile(ctx, file, w)
+}
+
+// StreamFile fetches chunks from live replicas, verifies their SHA-256 hashes and
+// writes them to w in order. The next few chunks are prefetched while the current
+// one is written, so memory use stays bounded regardless of file size. Nothing is
+// written to w if the first chunk cannot be fetched.
+func (s *MetadataService) StreamFile(ctx context.Context, file *model.File, w io.Writer) error {
+	if file.Status != model.FileStatusActive {
+		return errors.ErrFileNotReady
 	}
+	s.logger.Info("Starting file download", zap.Uint("file_id", file.ID))
 
-	chunks := make([][]byte, len(file.Chunks))
-
-	for _, chunk := range file.Chunks {
-		chunkData, err := s.fetchChunkFromReplicas(ctx, chunk, activeNodeMap)
-		if err != nil {
-			return fmt.Errorf("failed to fetch chunk seq %d: %w", chunk.Sequence, err)
-		}
-		chunks[chunk.Sequence] = chunkData
-	}
-
-	err = chunking.Merge(w, chunks)
+	activeNodeMap, _, err := s.liveAddresses(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to merge chunks: %w", err)
+		return err
 	}
 
-	s.logger.Info("File download completed successfully", zap.Uint("file_id", fileID))
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type fetched struct {
+		data []byte
+		err  error
+	}
+	results := make(chan fetched, downloadPrefetch)
+	go func() {
+		defer close(results)
+		for _, chunk := range file.Chunks {
+			data, err := s.fetchChunkFromReplicas(ctx, chunk, activeNodeMap)
+			if err != nil {
+				err = fmt.Errorf("failed to fetch chunk seq %d: %w", chunk.Sequence, err)
+			}
+			select {
+			case results <- fetched{data, err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	for range file.Chunks {
+		res, ok := <-results
+		if !ok {
+			return ctx.Err()
+		}
+		if res.err != nil {
+			return res.err
+		}
+		if _, err := w.Write(res.data); err != nil {
+			return fmt.Errorf("failed to write chunk to client: %w", err)
+		}
+	}
+
+	s.logger.Info("File download completed successfully", zap.Uint("file_id", file.ID))
 	return nil
 }
 
@@ -232,15 +353,14 @@ func (s *MetadataService) fetchChunkFromReplicas(ctx context.Context, chunk mode
 	for _, replica := range chunk.Replicas {
 		address, ok := activeNodeMap[replica.NodeID]
 		if !ok {
-			s.logger.Warn("Storage node replica is offline according to etcd", zap.String("node_id", replica.NodeID))
+			s.logger.Debug("Storage node replica is offline according to etcd", zap.String("node_id", replica.NodeID))
 			lastErr = errors.ErrNodeUnavailable
 			continue
 		}
 
-		s.logger.Info("Fetching chunk from replica", zap.String("node_id", replica.NodeID), zap.String("address", address))
 		data, err := s.downloadChunkFromNode(ctx, address, chunk.Hash)
 		if err != nil {
-			s.logger.Error("Failed to download chunk from replica", zap.String("node_id", replica.NodeID), zap.Error(err))
+			s.logger.Warn("Failed to download chunk from replica", zap.String("node_id", replica.NodeID), zap.Error(err))
 			lastErr = err
 			continue
 		}
@@ -263,7 +383,7 @@ func (s *MetadataService) fetchChunkFromReplicas(ctx context.Context, chunk mode
 
 func (s *MetadataService) downloadChunkFromNode(ctx context.Context, address, hash string) ([]byte, error) {
 	url := fmt.Sprintf("http://%s/chunk/%s", address, hash)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +401,157 @@ func (s *MetadataService) downloadChunkFromNode(ctx context.Context, address, ha
 		return nil, fmt.Errorf("node returned status %d", resp.StatusCode)
 	}
 
-	return io.ReadAll(resp.Body)
+	return io.ReadAll(io.LimitReader(resp.Body, chunking.DefaultChunkSize+1))
+}
+
+func (s *MetadataService) deleteChunkFromNode(ctx context.Context, address, hash string) error {
+	url := fmt.Sprintf("http://%s/chunk/%s", address, hash)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("node returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// DeleteFile removes a file's metadata, then deletes its chunk data from storage
+// nodes where no other file still references the same chunk. Chunk data on nodes
+// that are offline is left behind and logged.
+func (s *MetadataService) DeleteFile(ctx context.Context, fileID uint) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
+	file, err := s.repo.DeleteFile(fileID)
+	if err != nil {
+		return err
+	}
+	s.logger.Info("File metadata deleted", zap.Uint("file_id", fileID), zap.String("filename", file.Filename))
+
+	activeNodeMap, _, err := s.liveAddresses(ctx)
+	if err != nil {
+		s.logger.Warn("Could not discover nodes; chunk data left on storage nodes", zap.Uint("file_id", fileID), zap.Error(err))
+		return nil
+	}
+
+	type location struct{ hash, nodeID string }
+	seen := make(map[location]bool)
+	for _, chunk := range file.Chunks {
+		for _, replica := range chunk.Replicas {
+			loc := location{chunk.Hash, replica.NodeID}
+			if seen[loc] {
+				continue
+			}
+			seen[loc] = true
+
+			refs, err := s.repo.CountReplicaRefs(chunk.Hash, replica.NodeID)
+			if err != nil || refs > 0 {
+				continue // still used by another file (or unknown): keep it
+			}
+			address, ok := activeNodeMap[replica.NodeID]
+			if !ok {
+				s.logger.Warn("Node offline; orphaned chunk left behind", zap.String("node_id", replica.NodeID), zap.String("hash", chunk.Hash))
+				continue
+			}
+			if err := s.deleteChunkFromNode(ctx, address, chunk.Hash); err != nil {
+				s.logger.Warn("Failed to delete chunk from node", zap.String("node_id", replica.NodeID), zap.String("hash", chunk.Hash), zap.Error(err))
+			}
+		}
+	}
+	return nil
+}
+
+// RepairOnce restores the replication factor of every chunk belonging to an
+// ACTIVE file: chunks with fewer live replicas than targeted are copied from a
+// healthy replica (hash-verified) to additional live nodes. It returns the
+// number of chunks that gained at least one replica.
+func (s *MetadataService) RepairOnce(ctx context.Context) (int, error) {
+	s.mutationMu.RLock()
+	defer s.mutationMu.RUnlock()
+
+	activeNodeMap, nodes, err := s.liveAddresses(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(nodes) == 0 {
+		return 0, nil
+	}
+	target := min(s.repFactor, len(nodes))
+
+	chunks, err := s.repo.GetActiveChunks()
+	if err != nil {
+		return 0, fmt.Errorf("failed to list chunks: %w", err)
+	}
+
+	place := newPlacement(nodes)
+	repaired := 0
+	for _, chunk := range chunks {
+		if ctx.Err() != nil {
+			return repaired, ctx.Err()
+		}
+
+		holders := make(map[string]bool)
+		for _, r := range chunk.Replicas {
+			if _, ok := activeNodeMap[r.NodeID]; ok {
+				holders[r.NodeID] = true
+			}
+		}
+		missing := target - len(holders)
+		if missing <= 0 {
+			continue
+		}
+		if len(holders) == 0 {
+			s.logger.Error("Chunk has no live replicas; cannot repair until a holder returns",
+				zap.Uint("chunk_id", chunk.ID), zap.String("hash", chunk.Hash))
+			continue
+		}
+
+		data, err := s.fetchChunkFromReplicas(ctx, chunk, activeNodeMap)
+		if err != nil {
+			s.logger.Warn("Repair: could not read chunk from any live replica", zap.Uint("chunk_id", chunk.ID), zap.Error(err))
+			continue
+		}
+
+		replicas, err := s.replicateChunk(ctx, chunk.Hash, data, place.candidates(chunk.SizeBytes, holders), missing)
+		place.record(replicas, chunk.SizeBytes)
+		if err != nil {
+			s.logger.Warn("Repair: chunk still under-replicated", zap.Uint("chunk_id", chunk.ID), zap.Error(err))
+		}
+		if len(replicas) == 0 {
+			continue
+		}
+		if err := s.repo.AddReplicas(chunk.ID, replicas); err != nil {
+			s.logger.Error("Repair: failed to record new replicas", zap.Uint("chunk_id", chunk.ID), zap.Error(err))
+			continue
+		}
+		repaired++
+	}
+	return repaired, nil
+}
+
+// RunRepairLoop calls RepairOnce every interval until ctx is cancelled.
+func (s *MetadataService) RunRepairLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := s.RepairOnce(ctx)
+			if err != nil && !stderrors.Is(err, context.Canceled) {
+				s.logger.Warn("Replica repair pass failed", zap.Error(err))
+			} else if n > 0 {
+				s.logger.Info("Replica repair pass restored chunks", zap.Int("chunks", n))
+			}
+		}
+	}
 }
 
 // ListFiles lists all files in GORM.
@@ -318,34 +588,33 @@ func (s *MetadataService) GetAllNodeHealth(ctx context.Context) []NodeHealthResu
 				NodeID:  n.NodeID,
 				Address: n.Address,
 			}
+			defer func() { results[idx] = result }()
+
 			url := fmt.Sprintf("http://%s/health", n.Address)
-			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 			if err != nil {
 				result.Error = err.Error()
-				results[idx] = result
 				return
 			}
 			resp, err := healthClient.Do(req)
 			if err != nil {
-				result.Online = false
 				result.Error = "unreachable"
-				results[idx] = result
 				return
 			}
 			defer resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				result.Online = true
-				var payload map[string]interface{}
-				if json.NewDecoder(resp.Body).Decode(&payload) == nil {
-					if v, ok := payload["total_space"].(float64); ok {
-						result.TotalSpace = int64(v)
-					}
-					if v, ok := payload["free_space"].(float64); ok {
-						result.FreeSpace = int64(v)
-					}
-				}
+			if resp.StatusCode != http.StatusOK {
+				result.Error = fmt.Sprintf("status %d", resp.StatusCode)
+				return
 			}
-			results[idx] = result
+			result.Online = true
+			var payload struct {
+				TotalSpace int64 `json:"total_space"`
+				FreeSpace  int64 `json:"free_space"`
+			}
+			if json.NewDecoder(resp.Body).Decode(&payload) == nil {
+				result.TotalSpace = payload.TotalSpace
+				result.FreeSpace = payload.FreeSpace
+			}
 		}(i, node)
 	}
 	wg.Wait()

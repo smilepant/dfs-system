@@ -1,10 +1,8 @@
-FROM alpine:latest
-
+# Binaries are cross-compiled on the host (scripts/start.ps1 or scripts/start.sh),
+# which is far faster than compiling Go inside the Docker Desktop VM.
+FROM alpine:3.20
 RUN apk --no-cache add ca-certificates wget
-
 WORKDIR /app
-
-# Copy the pre-built Linux binary directly from the docker context (dfs-system/)
 COPY docker/storage-node-linux ./storage-node
 COPY configs/ /app/configs/
 

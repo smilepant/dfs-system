@@ -41,15 +41,8 @@ func (c *Coordinator) RegisterNode(ctx context.Context, info common.StorageNodeI
 	}
 	leaseID := resp.ID
 
-	key := fmt.Sprintf("/nodes/%s", info.NodeID)
-	val, err := json.Marshal(info)
-	if err != nil {
-		return 0, nil, fmt.Errorf("failed to marshal node info: %w", err)
-	}
-
-	_, err = c.cli.Put(ctx, key, string(val), clientv3.WithLease(leaseID))
-	if err != nil {
-		return 0, nil, fmt.Errorf("failed to put node register key: %w", err)
+	if err := c.UpdateNode(ctx, info, leaseID); err != nil {
+		return 0, nil, err
 	}
 
 	kaChan, err := c.cli.KeepAlive(ctx, leaseID)
@@ -58,6 +51,19 @@ func (c *Coordinator) RegisterNode(ctx context.Context, info common.StorageNodeI
 	}
 
 	return leaseID, kaChan, nil
+}
+
+// UpdateNode refreshes a node's registry entry (e.g. free space) under its existing lease.
+func (c *Coordinator) UpdateNode(ctx context.Context, info common.StorageNodeInfo, leaseID clientv3.LeaseID) error {
+	val, err := json.Marshal(info)
+	if err != nil {
+		return fmt.Errorf("failed to marshal node info: %w", err)
+	}
+	key := fmt.Sprintf("/nodes/%s", info.NodeID)
+	if _, err := c.cli.Put(ctx, key, string(val), clientv3.WithLease(leaseID)); err != nil {
+		return fmt.Errorf("failed to put node register key: %w", err)
+	}
+	return nil
 }
 
 // DiscoverNodes fetches all active storage nodes from the etcd key-value store.

@@ -7,10 +7,15 @@ import (
 	"os"
 
 	"dfs-system/internal/storage/service"
+	"dfs-system/pkg/chunking"
+	dfserrors "dfs-system/pkg/errors"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
+
+// maxChunkBody bounds a single chunk upload so a client cannot exhaust node memory.
+const maxChunkBody = chunking.DefaultChunkSize
 
 type StorageHandler struct {
 	store  *service.StorageService
@@ -27,52 +32,73 @@ func NewStorageHandler(store *service.StorageService, nodeID string, logger *zap
 	}
 }
 
+func (h *StorageHandler) writeStoreError(c *gin.Context, hash string, err error) {
+	switch {
+	case errors.Is(err, dfserrors.ErrInvalidChunkID):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	case errors.Is(err, dfserrors.ErrChunkCorrupted):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	case errors.Is(err, dfserrors.ErrInsufficientSpace):
+		c.JSON(http.StatusInsufficientStorage, gin.H{"error": err.Error()})
+	case errors.Is(err, os.ErrNotExist):
+		c.JSON(http.StatusNotFound, gin.H{"error": "chunk not found"})
+	default:
+		h.logger.Error("Chunk operation failed", zap.String("hash", hash), zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	}
+}
+
 // UploadChunk handles POST /chunk/upload?hash=<hash>
 func (h *StorageHandler) UploadChunk(c *gin.Context) {
 	hash := c.Query("hash")
 	if hash == "" {
-		h.logger.Error("Upload chunk failed: hash parameter is missing")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing hash query parameter"})
 		return
 	}
 
-	data, err := io.ReadAll(c.Request.Body)
+	data, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxChunkBody))
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "chunk exceeds maximum size"})
+			return
+		}
 		h.logger.Error("Upload chunk failed: failed to read request body", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read body"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
 		return
 	}
 
-	err = h.store.SaveChunk(hash, data)
-	if err != nil {
-		h.logger.Error("Upload chunk failed: failed to save chunk", zap.String("hash", hash), zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	if err := h.store.SaveChunk(hash, data); err != nil {
+		h.writeStoreError(c, hash, err)
 		return
 	}
 
-	h.logger.Info("Chunk uploaded successfully", zap.String("node_id", h.nodeID), zap.String("hash", hash), zap.Int("size", len(data)))
+	h.logger.Debug("Chunk stored", zap.String("node_id", h.nodeID), zap.String("hash", hash), zap.Int("size", len(data)))
 	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "chunk stored"})
 }
 
 // DownloadChunk handles GET /chunk/:id
 func (h *StorageHandler) DownloadChunk(c *gin.Context) {
 	hash := c.Param("id")
-	if hash == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "missing chunk id"})
-		return
-	}
-
-	data, err := h.store.GetChunk(hash)
+	file, info, err := h.store.OpenChunk(hash)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "chunk not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		h.writeStoreError(c, hash, err)
 		return
 	}
+	defer file.Close()
 
-	c.Data(http.StatusOK, "application/octet-stream", data)
+	c.Header("Content-Type", "application/octet-stream")
+	http.ServeContent(c.Writer, c.Request, "", info.ModTime(), file)
+}
+
+// DeleteChunk handles DELETE /chunk/:id
+func (h *StorageHandler) DeleteChunk(c *gin.Context) {
+	hash := c.Param("id")
+	if err := h.store.DeleteChunk(hash); err != nil {
+		h.writeStoreError(c, hash, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "chunk deleted"})
 }
 
 // Health handles GET /health

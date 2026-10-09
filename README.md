@@ -11,21 +11,23 @@ Client
   │
   ▼
 Metadata Server (Gin + GORM + SQLite)
-  │  ├── Receives uploaded file
-  │  ├── Splits into 4 MB chunks (pkg/chunking)
-  │  ├── Computes SHA-256 per chunk (pkg/hashing)
-  │  ├── Discovers active nodes via etcd
-  │  ├── Distributes chunks concurrently to N nodes
+  │  ├── Streams the uploaded file in 4 MB chunks (one chunk in memory at a time)
+  │  ├── Computes SHA-256 per chunk (pkg/hashing) — the chunk's content address
+  │  ├── Discovers live nodes (and their free space) via etcd
+  │  ├── Places each replica on the node with most projected free space,
+  │  │   falling back to another node if a replica write fails
   │  ├── Stores file/chunk/replica metadata in SQLite via GORM
-  │  └── On download: fetches chunks, verifies hash, streams file
+  │  ├── On download: fetches chunks (with prefetch), verifies hash, streams file
+  │  ├── On delete: removes chunk data no other file still references
+  │  └── Background repair: re-replicates chunks whose holders went offline
   │
-  ├── etcd (node registry, lease-based heartbeats)
+  ├── etcd (node registry, lease-based heartbeats + free-space updates)
   │
   └── Storage Nodes (×3) (Gin + afero)
-        ├── Registers with etcd on startup (TTL lease + keep-alive)
-        ├── Also registers with Metadata Server via POST /nodes/register
-        ├── Stores chunks as flat files on disk
-        └── Serves GET /chunk/:id  POST /chunk/upload  GET /health
+        ├── Registers with etcd (TTL lease + keep-alive), refreshes stats every interval
+        ├── Also registers with Metadata Server via POST /nodes/register (retried)
+        ├── Verifies chunk hash on write, writes atomically (temp file + rename)
+        └── Serves POST /chunk/upload  GET|DELETE /chunk/:id  GET /health
 ```
 
 ---
@@ -108,16 +110,25 @@ dfs-system/
 |--------|------------------------|------------------------------------------|
 | POST   | `/upload`              | Upload a file (multipart form-data)      |
 | GET    | `/download/:fileId`    | Download a file by its integer ID        |
-| GET    | `/files`               | List all registered files                |
+| GET    | `/files`               | List all registered files (newest first) |
+| GET    | `/files/:fileId`       | File metadata with chunk/replica map     |
+| DELETE | `/files/:fileId`       | Delete a file and its unshared chunks    |
 | POST   | `/nodes/register`      | Register a storage node in the DB        |
+| GET    | `/nodes/health`        | Health of every registered storage node  |
+
+Status codes: `404` unknown file, `409` file not `ACTIVE` (e.g. a `FAILED` upload),
+`503` not enough live nodes / replicas to serve the request.
 
 ### Storage Node (`:8081`, `:8082`, `:8083`)
 
-| Method | Path              | Description                          |
-|--------|-------------------|--------------------------------------|
-| POST   | `/chunk/upload`   | Store a chunk (`?hash=<sha256>`)     |
-| GET    | `/chunk/:id`      | Retrieve a chunk by hash             |
-| GET    | `/health`         | Node health + storage statistics     |
+| Method | Path              | Description                                        |
+|--------|-------------------|----------------------------------------------------|
+| POST   | `/chunk/upload`   | Store a chunk (`?hash=<sha256>`); body must match  |
+| GET    | `/chunk/:id`      | Retrieve a chunk by hash                           |
+| DELETE | `/chunk/:id`      | Delete a chunk                                     |
+| GET    | `/health`         | Node health + storage statistics                   |
+
+Chunk IDs must be 64-char lowercase hex SHA-256 digests; anything else is rejected with `400`.
 
 ---
 
@@ -267,9 +278,10 @@ go test -v ./...
 
 | Package                         | Tests                              |
 |---------------------------------|------------------------------------|
-| `pkg/chunking`                  | Split + Merge round-trip           |
-| `pkg/hashing`                   | SHA-256 correctness, determinism   |
-| `internal/storage/service`      | afero chunk save/read/stats        |
+| `pkg/chunking`                  | Split + Merge round-trip, streaming reader edge cases |
+| `pkg/hashing`                   | SHA-256 correctness, determinism, chunk-ID validation |
+| `internal/storage/service`      | Chunk save/read/delete, hash verification, path traversal, capacity, restart recovery |
+| `internal/metadata/service`     | End-to-end upload/download against in-process storage nodes: placement spread, write failover, node loss, corruption, re-replication, dedup-safe delete |
 | `tests/integration`             | GORM repo + etcd (skipped if down) |
 
 ---
@@ -282,22 +294,35 @@ metadata:
   db_path: "./metadata.db"
   replication_factor: 2        # Number of storage node replicas per chunk
   etcd_endpoints: ["etcd:2379"]
+  repair_interval: 30          # Seconds between re-replication passes (negative disables)
 
 storage:
   node_id: "storage-node-1"
   port: 8081
   storage_root: "/data"
   etcd_endpoints: ["etcd:2379"]
-  heartbeat_interval: 5        # Seconds between etcd lease renewals
+  heartbeat_interval: 5        # Seconds between etcd stats refreshes (lease TTL = 3×)
   metadata_server_url: "http://metadata-server:8000"
+  # advertise_address: "host:port"   # how others reach this node (default: localhost:<port>, or <node_id>:<port> in Docker)
+  # capacity_bytes: 5368709120       # advertised capacity (default 5 GiB)
 ```
 
-All config values can also be overridden via CLI flags.
+All config values can also be overridden via CLI flags (`-etcd` accepts a comma-separated list;
+storage nodes also accept `-advertise` and `-capacity`; the metadata server accepts `-repair-interval`).
 
 ---
 
 ## Fault Tolerance
 
 - **Node failure**: If a storage node goes offline, its etcd lease expires. The Metadata Server detects this during `DiscoverNodes()` and skips that node's address — the chunk is fetched from another live replica instead.
-- **Chunk corruption**: Each downloaded chunk is verified against its stored SHA-256 hash. If hashes don't match, the system tries the next available replica.
+- **Re-replication**: Every `repair_interval` seconds the Metadata Server finds chunks with fewer live replicas than the replication factor, copies them (hash-verified) from a surviving replica to other live nodes, and records the new replicas. A second failure after repair therefore doesn't lose data.
+- **Write failover**: If a storage node rejects or fails a chunk write, the next-best node is tried. If the replication factor still can't be met, the file is kept as `FAILED` (with whatever replicas were written) so `DELETE /files/:id` can reclaim the space.
+- **Chunk corruption**: Storage nodes refuse chunks whose content doesn't match the declared hash. Each downloaded chunk is verified again against its SHA-256 hash; on mismatch the next replica is tried.
+- **Crash safety**: Chunks are written to a temp file, fsynced and renamed into place, so a crash never leaves a half-written chunk under its final name. Stale temp files are removed on startup.
+- **Deduplication-safe deletes**: Chunks are content-addressed and may be shared by several files. A chunk is removed from a node only when no remaining file references it there.
 - **Replication factor**: With `replication_factor: 2`, every chunk is stored on 2 nodes, so the system tolerates 1 node failure without data loss.
+
+### Known limitations
+- The Metadata Server (SQLite) is a single point of failure.
+- Chunk data on a node that is offline when its file is deleted is left behind (orphaned) — there is no orphan GC yet.
+- There is no authentication; don't expose the ports publicly.

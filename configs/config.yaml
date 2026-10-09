@@ -3,6 +3,7 @@ metadata:
   db_path: "./metadata.db"
   replication_factor: 2
   etcd_endpoints: ["etcd:2379"]
+  repair_interval: 30          # Seconds between re-replication passes (negative disables)
 
 storage:
   node_id: "storage-node-1"

@@ -1,2 +1,9 @@
 /metadata-server.exe
 /storage-node.exe
+/docker/metadata-server-linux
+/docker/storage-node-linux
+*.db
+*.db-shm
+*.db-wal
+/data/
+/data-node-*/

@@ -12,31 +12,18 @@ import (
 
 	"dfs-system/internal/common/config"
 	"dfs-system/internal/common/logger"
+	"dfs-system/internal/common/middleware"
 	"dfs-system/internal/coordinator"
 	"dfs-system/internal/metadata/handler"
 	"dfs-system/internal/metadata/model"
 	"dfs-system/internal/metadata/repository"
 	"dfs-system/internal/metadata/service"
 
-	"github.com/glebarez/sqlite"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 )
-
-// corsMiddleware adds CORS headers so the web dashboard can call the API from any origin.
-func corsMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept")
-		if c.Request.Method == http.MethodOptions {
-			c.AbortWithStatus(http.StatusNoContent)
-			return
-		}
-		c.Next()
-	}
-}
 
 func main() {
 	configPath := flag.String("config", "configs/config.yaml", "Path to config file")
@@ -44,6 +31,7 @@ func main() {
 	dbPath := flag.String("db", "", "Overriding database path")
 	etcdEndpoints := flag.String("etcd", "", "Comma-separated etcd endpoints")
 	repFactor := flag.Int("rep", 0, "Overriding replication factor")
+	repairInterval := flag.Int("repair-interval", 0, "Seconds between re-replication passes (negative disables)")
 	webDir := flag.String("web", "./web", "Path to web dashboard directory")
 	flag.Parse()
 
@@ -62,28 +50,61 @@ func main() {
 		cfg = &config.Config{}
 	}
 
-	if *port != 0          { cfg.Metadata.Port = *port }
-	if *dbPath != ""       { cfg.Metadata.DBPath = *dbPath }
-	if *etcdEndpoints != "" { cfg.Metadata.EtcdEndpoints = []string{*etcdEndpoints} }
-	if *repFactor != 0     { cfg.Metadata.ReplicationFactor = *repFactor }
+	if *port != 0 {
+		cfg.Metadata.Port = *port
+	}
+	if *dbPath != "" {
+		cfg.Metadata.DBPath = *dbPath
+	}
+	if *etcdEndpoints != "" {
+		cfg.Metadata.EtcdEndpoints = config.SplitList(*etcdEndpoints)
+	}
+	if *repFactor != 0 {
+		cfg.Metadata.ReplicationFactor = *repFactor
+	}
+	if *repairInterval != 0 {
+		cfg.Metadata.RepairInterval = *repairInterval
+	}
 
 	// Defaults
-	if cfg.Metadata.Port == 0               { cfg.Metadata.Port = 8000 }
-	if cfg.Metadata.DBPath == ""            { cfg.Metadata.DBPath = "./metadata.db" }
-	if len(cfg.Metadata.EtcdEndpoints) == 0 { cfg.Metadata.EtcdEndpoints = []string{"localhost:2379"} }
-	if cfg.Metadata.ReplicationFactor == 0  { cfg.Metadata.ReplicationFactor = 2 }
+	if cfg.Metadata.Port == 0 {
+		cfg.Metadata.Port = 8000
+	}
+	if cfg.Metadata.DBPath == "" {
+		cfg.Metadata.DBPath = "./metadata.db"
+	}
+	if len(cfg.Metadata.EtcdEndpoints) == 0 {
+		cfg.Metadata.EtcdEndpoints = []string{"localhost:2379"}
+	}
+	if cfg.Metadata.ReplicationFactor == 0 {
+		cfg.Metadata.ReplicationFactor = 2
+	}
+	if cfg.Metadata.RepairInterval == 0 {
+		cfg.Metadata.RepairInterval = 30
+	}
 
 	log.Info("Starting Metadata Server",
 		zap.Int("port", cfg.Metadata.Port),
 		zap.String("db", cfg.Metadata.DBPath),
 		zap.Strings("etcd", cfg.Metadata.EtcdEndpoints),
 		zap.Int("rep_factor", cfg.Metadata.ReplicationFactor),
+		zap.Int("repair_interval", cfg.Metadata.RepairInterval),
 	)
 
 	// 3. Database + auto-migrate
 	gormDB, err := gorm.Open(sqlite.Open(cfg.Metadata.DBPath), &gorm.Config{})
 	if err != nil {
 		log.Fatal("Failed to open database", zap.Error(err))
+	}
+	// SQLite allows a single writer; one pooled connection avoids "database is locked"
+	// errors under concurrent uploads, and WAL keeps reads from blocking on writes.
+	sqlDB, err := gormDB.DB()
+	if err != nil {
+		log.Fatal("Failed to access database handle", zap.Error(err))
+	}
+	sqlDB.SetMaxOpenConns(1)
+	if err := gormDB.Exec("PRAGMA journal_mode=WAL").Error; err != nil {
+		log.Warn("Could not enable WAL mode", zap.Error(err))
 	}
 	if err := gormDB.AutoMigrate(&model.File{}, &model.Chunk{}, &model.ChunkReplica{}, &model.StorageNode{}); err != nil {
 		log.Fatal("Database migration failed", zap.Error(err))
@@ -112,28 +133,25 @@ func main() {
 	svc := service.NewMetadataService(repo, etcdCoord, cfg.Metadata.ReplicationFactor, log)
 	h := handler.NewMetadataHandler(svc, log)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if cfg.Metadata.RepairInterval > 0 {
+		go svc.RunRepairLoop(ctx, time.Duration(cfg.Metadata.RepairInterval)*time.Second)
+	}
+
 	// 6. Gin router
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
-	r.Use(corsMiddleware())
-
-	// Zap request logger
-	r.Use(func(c *gin.Context) {
-		start := time.Now()
-		c.Next()
-		log.Info("HTTP",
-			zap.String("method", c.Request.Method),
-			zap.String("path", c.Request.URL.Path),
-			zap.Int("status", c.Writer.Status()),
-			zap.Duration("latency", time.Since(start)),
-		)
-	})
+	r.Use(middleware.CORS())
+	r.Use(middleware.RequestLogger(log))
 
 	// API routes
 	r.POST("/upload", h.Upload)
 	r.GET("/download/:fileId", h.Download)
 	r.GET("/files", h.ListFiles)
+	r.GET("/files/:fileId", h.GetFile)
+	r.DELETE("/files/:fileId", h.DeleteFile)
 	r.POST("/nodes/register", h.RegisterNode)
 	r.GET("/nodes/health", h.NodesHealth)
 
@@ -143,8 +161,9 @@ func main() {
 
 	// 7. HTTP server
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", cfg.Metadata.Port),
-		Handler: r,
+		Addr:              fmt.Sprintf(":%d", cfg.Metadata.Port),
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
@@ -159,11 +178,12 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Info("Shutting down Metadata Server…")
+	cancel()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatal("Forced shutdown", zap.Error(err))
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Error("Forced shutdown", zap.Error(err))
 	}
 	log.Info("Metadata Server stopped.")
 }

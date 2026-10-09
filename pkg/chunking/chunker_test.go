@@ -2,6 +2,7 @@ package chunking
 
 import (
 	"bytes"
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -26,4 +27,21 @@ func TestChunkerSplitAndMerge(t *testing.T) {
 	err = Merge(&buf, chunks)
 	assert.NoError(t, err)
 	assert.Equal(t, data, buf.Bytes())
+}
+
+func TestReaderExactMultipleAndEmpty(t *testing.T) {
+	// Exact multiple of chunk size must not yield a trailing empty chunk.
+	cr := NewReader(bytes.NewReader(make([]byte, 20)), 10)
+	for i := 0; i < 2; i++ {
+		chunk, err := cr.Next()
+		assert.NoError(t, err)
+		assert.Len(t, chunk, 10)
+	}
+	_, err := cr.Next()
+	assert.Equal(t, io.EOF, err)
+
+	// Empty input yields no chunks.
+	chunks, err := Split(bytes.NewReader(nil), 10)
+	assert.NoError(t, err)
+	assert.Empty(t, chunks)
 }

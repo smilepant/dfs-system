@@ -400,6 +400,8 @@
           <div><span style="color:var(--green)">POST</span>  <span style="color:var(--accent)">/upload</span>          multipart/form-data</div>
           <div><span style="color:var(--accent)">GET</span>   <span style="color:var(--accent)">/download/:fileId</span>  binary stream</div>
           <div><span style="color:var(--accent)">GET</span>   <span style="color:var(--accent)">/files</span>            JSON array</div>
+          <div><span style="color:var(--accent)">GET</span>   <span style="color:var(--accent)">/files/:fileId</span>     chunk map</div>
+          <div><span style="color:var(--red)">DELETE</span> <span style="color:var(--accent)">/files/:fileId</span>   remove file</div>
           <div><span style="color:var(--green)">POST</span>  <span style="color:var(--accent)">/nodes/register</span>   JSON body</div>
           <div><span style="color:var(--accent)">GET</span>   <span style="color:var(--accent)">/health</span>           node health</div>
         </div>
@@ -469,6 +471,11 @@
     return bytes + ' B';
   }
 
+  // Escape untrusted text (filenames, server errors) before inserting it into HTML.
+  function esc(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+  }
+
   function fileIcon(name) {
     const ext = (name||'').split('.').pop().toLowerCase();
     const map = { png:'🖼️', jpg:'🖼️', jpeg:'🖼️', gif:'🖼️', svg:'🖼️', webp:'🖼️',
@@ -486,7 +493,7 @@
     const icons = { success:'✅', error:'❌', info:'ℹ️' };
     const el = document.createElement('div');
     el.className = `toast ${type}`;
-    el.innerHTML = `<span>${icons[type]}</span><span>${msg}</span>`;
+    el.innerHTML = `<span>${icons[type]}</span><span>${esc(msg)}</span>`;
     $('toast-container').appendChild(el);
     setTimeout(() => {
       el.style.animation = 'toastOut 0.3s ease forwards';
@@ -535,7 +542,7 @@
       grid.innerHTML += `
         <div class="node-card ${online ? 'online' : 'offline'}">
           <div class="node-header">
-            <span class="node-id">:${port} ${data ? '— ' + (data.node_id || '') : ''}</span>
+            <span class="node-id">:${esc(port)} ${data ? '— ' + esc(data.node_id || '') : ''}</span>
             <span class="badge ${online ? 'badge-green' : 'badge-red'}">${online ? 'Online' : 'Offline'}</span>
           </div>
           ${online ? `
@@ -562,7 +569,7 @@
             </div>
           ` : `
             <div style="font-size:0.82rem;color:var(--muted);margin-top:0.5rem">
-              Could not reach <span style="font-family:'JetBrains Mono',monospace">localhost:${port}/health</span>
+              Could not reach <span style="font-family:'JetBrains Mono',monospace">localhost:${esc(port)}/health</span>
             </div>
           `}
         </div>`;
@@ -570,6 +577,8 @@
   }
 
   /* ─── File list ─── */
+  let fileNames = new Map();
+
   async function loadFiles() {
     const tbody = $('files-tbody');
     try {
@@ -584,34 +593,37 @@
       }
 
       $('file-count').textContent = `${files.length} file${files.length !== 1 ? 's' : ''}`;
+      fileNames = new Map(files.map(f => [f.id, f.filename]));
 
       tbody.innerHTML = files.map(f => {
+        const id = Number(f.id);
         const statusClass = f.status === 'ACTIVE' ? 'status-active' : f.status === 'PENDING' ? 'status-pending' : 'status-failed';
         const chunkCount  = f.chunks ? f.chunks.length : '—';
         const created = f.created_at ? new Date(f.created_at).toLocaleString() : '—';
         return `
           <tr>
-            <td class="mono">#${f.id}</td>
+            <td class="mono">#${id}</td>
             <td>
               <div class="file-name">
                 <span class="file-icon">${fileIcon(f.filename)}</span>
-                <span>${f.filename}</span>
+                <span>${esc(f.filename)}</span>
               </div>
             </td>
             <td class="mono">${fmt(f.size_bytes)}</td>
             <td><span class="chunk-pill">◼ ${chunkCount}</span></td>
-            <td><span class="${statusClass}">${f.status}</span></td>
+            <td><span class="${statusClass}">${esc(f.status)}</span></td>
             <td class="mono" style="font-size:0.75rem">${created}</td>
             <td>
               <div style="display:flex;gap:6px">
-                <button class="btn btn-ghost btn-sm" onclick="downloadById(${f.id}, '${f.filename}')">⬇ Download</button>
-                <button class="btn btn-ghost btn-sm" onclick="inspectFile(${f.id})" data-tip="View chunk map">🔍</button>
+                <button class="btn btn-ghost btn-sm" onclick="downloadById(${id})" ${f.status === 'ACTIVE' ? '' : 'disabled'}>⬇ Download</button>
+                <button class="btn btn-ghost btn-sm" onclick="inspectFile(${id})" data-tip="View chunk map">🔍</button>
+                <button class="btn btn-ghost btn-sm" onclick="deleteFileById(${id})" data-tip="Delete file" style="color:var(--red)">🗑</button>
               </div>
             </td>
           </tr>`;
       }).join('');
     } catch(e) {
-      tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state"><div class="empty-icon">⚠️</div><p>Failed to load files: ${e.message}</p></div></td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state"><div class="empty-icon">⚠️</div><p>Failed to load files: ${esc(e.message)}</p></div></td></tr>`;
       $('file-count').textContent = 'Error';
     }
   }
@@ -709,10 +721,14 @@
 
   /* ─── Download ─── */
   async function downloadById(id, filename) {
+    filename = filename || fileNames.get(id);
     toast(`Fetching file #${id} from DFS…`, 'info');
     try {
       const r = await fetch(`${baseURL()}/download/${id}`);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${r.status}`);
+      }
       const blob = await r.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -733,12 +749,34 @@
   /* ─── Inspect (chunk map) ─── */
   async function inspectFile(id) {
     try {
-      const files = await fetch(baseURL() + '/files').then(r => r.json());
-      const f = files.find(x => x.id == id);
-      if (!f) { toast('File not found', 'error'); return; }
-      toast(`File #${id}: ${f.chunks ? f.chunks.length : 0} chunks, status ${f.status}`, 'info', 5000);
+      const r = await fetch(`${baseURL()}/files/${id}`);
+      if (!r.ok) { toast('File not found', 'error'); return; }
+      const f = await r.json();
+      const chunks = f.chunks || [];
+      const perNode = {};
+      chunks.forEach(c => (c.replicas || []).forEach(rep => { perNode[rep.node_id] = (perNode[rep.node_id] || 0) + 1; }));
+      const spread = Object.entries(perNode).map(([n, c]) => `${n}: ${c}`).join(', ') || 'none';
+      toast(`File #${id}: ${chunks.length} chunks, status ${f.status}. Replicas per node: ${spread}`, 'info', 6000);
     } catch(e) {
       toast(e.message, 'error');
+    }
+  }
+
+  /* ─── Delete ─── */
+  async function deleteFileById(id) {
+    const name = fileNames.get(id) || `#${id}`;
+    if (!confirm(`Delete "${name}" from the DFS? This cannot be undone.`)) return;
+    try {
+      const r = await fetch(`${baseURL()}/files/${id}`, { method: 'DELETE' });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${r.status}`);
+      }
+      toast(`"${name}" deleted`, 'success');
+      loadFiles();
+      loadNodes();
+    } catch(e) {
+      toast(`Delete failed: ${e.message}`, 'error', 5000);
     }
   }
 

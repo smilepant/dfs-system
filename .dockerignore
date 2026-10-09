@@ -1,0 +1,7 @@
+.git
+*.exe
+*.db
+*.db-shm
+*.db-wal
+data/
+data-node-*/

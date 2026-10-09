@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -16,6 +17,7 @@ type MetadataConfig struct {
 	DBPath            string   `yaml:"db_path"`
 	ReplicationFactor int      `yaml:"replication_factor"`
 	EtcdEndpoints     []string `yaml:"etcd_endpoints"`
+	RepairInterval    int      `yaml:"repair_interval"` // in seconds; 0 = default, <0 = disabled
 }
 
 type StorageConfig struct {
@@ -25,6 +27,8 @@ type StorageConfig struct {
 	EtcdEndpoints     []string `yaml:"etcd_endpoints"`
 	HeartbeatInterval int      `yaml:"heartbeat_interval"` // in seconds
 	MetadataServerURL string   `yaml:"metadata_server_url"`
+	AdvertiseAddress  string   `yaml:"advertise_address"` // host:port other services use to reach this node
+	CapacityBytes     int64    `yaml:"capacity_bytes"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -40,4 +44,15 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// SplitList splits a comma-separated flag value, trimming blanks.
+func SplitList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }

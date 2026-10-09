@@ -15,6 +15,7 @@ services:
       - "2379:2379"
 
   metadata-server:
+    image: dfs-metadata-server:latest
     build:
       context: ..
       dockerfile: docker/metadata.Dockerfile
@@ -28,7 +29,10 @@ services:
     depends_on:
       - etcd
 
+  # Only storage-node-1 builds the storage image; nodes 2 and 3 reuse it
+  # instead of compiling the same code three times.
   storage-node-1:
+    image: dfs-storage-node:latest
     build:
       context: ..
       dockerfile: docker/storage.Dockerfile
@@ -42,9 +46,8 @@ services:
       - metadata-server
 
   storage-node-2:
-    build:
-      context: ..
-      dockerfile: docker/storage.Dockerfile
+    image: dfs-storage-node:latest
+    pull_policy: never
     ports:
       - "8082:8082"
     command: ["./storage-node", "-config", "configs/config.yaml", "-id", "storage-node-2", "-port", "8082", "-dir", "/data/node-2", "-etcd", "etcd:2379", "-metadata-url", "http://metadata-server:8000"]
@@ -53,11 +56,11 @@ services:
     depends_on:
       - etcd
       - metadata-server
+      - storage-node-1
 
   storage-node-3:
-    build:
-      context: ..
-      dockerfile: docker/storage.Dockerfile
+    image: dfs-storage-node:latest
+    pull_policy: never
     ports:
       - "8083:8083"
     command: ["./storage-node", "-config", "configs/config.yaml", "-id", "storage-node-3", "-port", "8083", "-dir", "/data/node-3", "-etcd", "etcd:2379", "-metadata-url", "http://metadata-server:8000"]
@@ -66,6 +69,7 @@ services:
     depends_on:
       - etcd
       - metadata-server
+      - storage-node-1
 
 volumes:
   metadata-db-data:

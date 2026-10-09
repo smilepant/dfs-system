@@ -12,6 +12,7 @@ import (
 
 	"dfs-system/internal/common/config"
 	"dfs-system/internal/common/logger"
+	"dfs-system/internal/common/middleware"
 	"dfs-system/internal/coordinator"
 	"dfs-system/internal/storage/handler"
 	"dfs-system/internal/storage/node"
@@ -22,18 +23,6 @@ import (
 	"go.uber.org/zap"
 )
 
-func corsMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept")
-		if c.Request.Method == http.MethodOptions {
-			c.AbortWithStatus(http.StatusNoContent)
-			return
-		}
-		c.Next()
-	}
-}
 func main() {
 	configPath := flag.String("config", "configs/config.yaml", "Path to config file")
 	nodeID := flag.String("id", "", "Overriding Storage Node ID")
@@ -41,6 +30,8 @@ func main() {
 	storageDir := flag.String("dir", "", "Overriding storage directory")
 	etcdEndpoints := flag.String("etcd", "", "Comma-separated etcd endpoints")
 	metadataURL := flag.String("metadata-url", "", "Overriding metadata server URL")
+	advertise := flag.String("advertise", "", "host:port other services use to reach this node")
+	capacity := flag.Int64("capacity", 0, "Storage capacity in bytes (default 5 GiB)")
 	flag.Parse()
 
 	// 1. Initialize Logger
@@ -69,10 +60,16 @@ func main() {
 		cfg.Storage.StorageRoot = *storageDir
 	}
 	if *etcdEndpoints != "" {
-		cfg.Storage.EtcdEndpoints = []string{*etcdEndpoints}
+		cfg.Storage.EtcdEndpoints = config.SplitList(*etcdEndpoints)
 	}
 	if *metadataURL != "" {
 		cfg.Storage.MetadataServerURL = *metadataURL
+	}
+	if *advertise != "" {
+		cfg.Storage.AdvertiseAddress = *advertise
+	}
+	if *capacity != 0 {
+		cfg.Storage.CapacityBytes = *capacity
 	}
 
 	// Set defaults if config is empty
@@ -94,16 +91,24 @@ func main() {
 	if cfg.Storage.HeartbeatInterval == 0 {
 		cfg.Storage.HeartbeatInterval = 5
 	}
+	if cfg.Storage.AdvertiseAddress == "" {
+		// In Docker the container name (== node ID) is resolvable; locally use localhost.
+		cfg.Storage.AdvertiseAddress = fmt.Sprintf("localhost:%d", cfg.Storage.Port)
+		if os.Getenv("RUNNING_IN_DOCKER") == "true" {
+			cfg.Storage.AdvertiseAddress = fmt.Sprintf("%s:%d", cfg.Storage.NodeID, cfg.Storage.Port)
+		}
+	}
 
 	log.Info("Starting Storage Node...",
 		zap.String("node_id", cfg.Storage.NodeID),
 		zap.Int("port", cfg.Storage.Port),
+		zap.String("advertise", cfg.Storage.AdvertiseAddress),
 		zap.String("storage_root", cfg.Storage.StorageRoot),
 	)
 
 	// 3. Initialize Storage Service
 	fs := afero.NewOsFs()
-	store, err := service.NewStorageService(fs, cfg.Storage.StorageRoot)
+	store, err := service.NewStorageService(fs, cfg.Storage.StorageRoot, cfg.Storage.CapacityBytes)
 	if err != nil {
 		log.Fatal("Failed to initialize storage service", zap.Error(err))
 	}
@@ -119,15 +124,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Determine address registration format
-	nodeAddress := fmt.Sprintf("%s:%d", cfg.Storage.NodeID, cfg.Storage.Port)
-	if os.Getenv("RUNNING_IN_DOCKER") != "true" {
-		nodeAddress = fmt.Sprintf("localhost:%d", cfg.Storage.Port)
-	}
-
 	worker := node.NewWorker(
 		cfg.Storage.NodeID,
-		nodeAddress,
+		cfg.Storage.AdvertiseAddress,
 		cfg.Storage.MetadataServerURL,
 		cfg.Storage.HeartbeatInterval,
 		store,
@@ -140,35 +139,21 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
-
-	// CORS
-	r.Use(corsMiddleware())
-
-	// Logger middleware for Gin
-	r.Use(func(c *gin.Context) {
-		start := time.Now()
-		path := c.Request.URL.Path
-		query := c.Request.URL.RawQuery
-		c.Next()
-		log.Info("Request Log",
-			zap.String("method", c.Request.Method),
-			zap.String("path", path),
-			zap.String("query", query),
-			zap.Int("status", c.Writer.Status()),
-			zap.Duration("duration", time.Since(start)),
-		)
-	})
+	r.Use(middleware.CORS())
+	r.Use(middleware.RequestLogger(log))
 
 	h := handler.NewStorageHandler(store, cfg.Storage.NodeID, log)
 
 	r.POST("/chunk/upload", h.UploadChunk)
 	r.GET("/chunk/:id", h.DownloadChunk)
+	r.DELETE("/chunk/:id", h.DeleteChunk)
 	r.GET("/health", h.Health)
 
 	// 7. Start HTTP Server
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", cfg.Storage.Port),
-		Handler: r,
+		Addr:              fmt.Sprintf(":%d", cfg.Storage.Port),
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
@@ -190,7 +175,7 @@ func main() {
 	defer shutdownCancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatal("Server forced to shutdown", zap.Error(err))
+		log.Error("Server forced to shutdown", zap.Error(err))
 	}
 
 	log.Info("Storage Node stopped.")
