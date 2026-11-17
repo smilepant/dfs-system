@@ -31,6 +31,7 @@ type StorageConfig struct {
 	CapacityBytes     int64    `yaml:"capacity_bytes"`
 }
 
+// LoadConfig reads metadata and storage settings from a YAML file.
 func LoadConfig(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {

@@ -32,6 +32,7 @@ func NewStorageHandler(store *service.StorageService, nodeID string, logger *zap
 	}
 }
 
+// writeStoreError converts chunk storage errors into HTTP error responses.
 func (h *StorageHandler) writeStoreError(c *gin.Context, hash string, err error) {
 	switch {
 	case errors.Is(err, dfserrors.ErrInvalidChunkID):
@@ -48,7 +49,7 @@ func (h *StorageHandler) writeStoreError(c *gin.Context, hash string, err error)
 	}
 }
 
-// UploadChunk handles POST /chunk/upload?hash=<hash>
+// UploadChunk reads a bounded upload and stores it after checking its hash.
 func (h *StorageHandler) UploadChunk(c *gin.Context) {
 	hash := c.Query("hash")
 	if hash == "" {
@@ -77,7 +78,7 @@ func (h *StorageHandler) UploadChunk(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "chunk stored"})
 }
 
-// DownloadChunk handles GET /chunk/:id
+// DownloadChunk streams a stored chunk to the client.
 func (h *StorageHandler) DownloadChunk(c *gin.Context) {
 	hash := c.Param("id")
 	file, info, err := h.store.OpenChunk(hash)
@@ -91,7 +92,7 @@ func (h *StorageHandler) DownloadChunk(c *gin.Context) {
 	http.ServeContent(c.Writer, c.Request, "", info.ModTime(), file)
 }
 
-// DeleteChunk handles DELETE /chunk/:id
+// DeleteChunk removes a chunk identified by its hash.
 func (h *StorageHandler) DeleteChunk(c *gin.Context) {
 	hash := c.Param("id")
 	if err := h.store.DeleteChunk(hash); err != nil {
@@ -101,7 +102,7 @@ func (h *StorageHandler) DeleteChunk(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "chunk deleted"})
 }
 
-// Health handles GET /health
+// Health reports the node's ID, capacity, and remaining free space.
 func (h *StorageHandler) Health(c *gin.Context) {
 	total, free, err := h.store.GetStats()
 	if err != nil {

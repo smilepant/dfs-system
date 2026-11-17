@@ -23,6 +23,7 @@ import (
 	"go.uber.org/zap"
 )
 
+// main starts chunk storage, node registration, and the storage HTTP API.
 func main() {
 	configPath := flag.String("config", "configs/config.yaml", "Path to config file")
 	nodeID := flag.String("id", "", "Overriding Storage Node ID")

@@ -91,6 +91,7 @@ func (s *MetadataService) RepairFile(ctx context.Context, fileID uint) (*RepairR
 	return result, nil
 }
 
+// repairChunks rewrites damaged replicas and adds missing copies from verified data.
 func (s *MetadataService) repairChunks(ctx context.Context, file *model.File) (*RepairResult, error) {
 	activeNodeMap, nodes, err := s.liveAddresses(ctx)
 	if err != nil {
@@ -187,6 +188,7 @@ func (s *MetadataService) repairChunks(ctx context.Context, file *model.File) (*
 	return result, nil
 }
 
+// summarizeRepair describes repair counts and the file's resulting integrity status.
 func summarizeRepair(r *RepairResult) string {
 	var parts []string
 	if r.ReplicasRewritten > 0 {

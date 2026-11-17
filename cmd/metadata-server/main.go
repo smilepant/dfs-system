@@ -25,6 +25,7 @@ import (
 	"gorm.io/gorm"
 )
 
+// main configures the metadata API, database, node discovery, and background repair.
 func main() {
 	configPath := flag.String("config", "configs/config.yaml", "Path to config file")
 	port := flag.Int("port", 0, "Overriding port")

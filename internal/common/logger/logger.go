@@ -7,6 +7,7 @@ import (
 
 var Log *zap.Logger
 
+// InitLogger creates and installs a development or production logger.
 func InitLogger(devMode bool) (*zap.Logger, error) {
 	var cfg zap.Config
 	if devMode {

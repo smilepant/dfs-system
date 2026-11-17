@@ -63,6 +63,7 @@ func NewStorageService(fs afero.Fs, storageRoot string, capacity int64) (*Storag
 	return s, nil
 }
 
+// chunkPath validates the chunk hash and builds its path inside the storage root.
 func (s *StorageService) chunkPath(hash string) (string, error) {
 	if !hashing.IsValidSHA256(hash) {
 		return "", errors.ErrInvalidChunkID

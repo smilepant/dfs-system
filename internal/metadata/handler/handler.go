@@ -50,6 +50,7 @@ func statusFor(err error) int {
 	}
 }
 
+// parseFileID reads the file ID from the URL and rejects invalid values.
 func parseFileID(c *gin.Context) (uint, bool) {
 	fileID, err := strconv.ParseUint(c.Param("fileId"), 10, 32)
 	if err != nil {
@@ -59,7 +60,7 @@ func parseFileID(c *gin.Context) (uint, bool) {
 	return uint(fileID), true
 }
 
-// Upload handles POST /upload
+// Upload accepts a file, delegates chunking and replication, and returns its metadata.
 func (h *MetadataHandler) Upload(c *gin.Context) {
 	fileHeader, err := c.FormFile("file")
 	if err != nil {
@@ -85,7 +86,7 @@ func (h *MetadataHandler) Upload(c *gin.Context) {
 	c.JSON(http.StatusOK, fileModel)
 }
 
-// Download handles GET /download/:fileId
+// Download streams a stored file with its filename, size, and checksum headers.
 func (h *MetadataHandler) Download(c *gin.Context) {
 	fileID, ok := parseFileID(c)
 	if !ok {
@@ -127,7 +128,7 @@ func (h *MetadataHandler) Download(c *gin.Context) {
 	// connection so the client sees a truncated transfer, not a corrupt file.
 }
 
-// GetFile handles GET /files/:fileId
+// GetFile returns a file's metadata, chunks, and replica locations.
 func (h *MetadataHandler) GetFile(c *gin.Context) {
 	fileID, ok := parseFileID(c)
 	if !ok {
@@ -141,7 +142,7 @@ func (h *MetadataHandler) GetFile(c *gin.Context) {
 	c.JSON(http.StatusOK, file)
 }
 
-// DeleteFile handles DELETE /files/:fileId
+// DeleteFile removes a file and requests cleanup of its unshared chunks.
 func (h *MetadataHandler) DeleteFile(c *gin.Context) {
 	fileID, ok := parseFileID(c)
 	if !ok {
@@ -157,7 +158,7 @@ func (h *MetadataHandler) DeleteFile(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "file deleted"})
 }
 
-// ListFiles handles GET /files
+// ListFiles returns metadata for all stored files.
 func (h *MetadataHandler) ListFiles(c *gin.Context) {
 	files, err := h.svc.ListFiles()
 	if err != nil {
@@ -167,7 +168,7 @@ func (h *MetadataHandler) ListFiles(c *gin.Context) {
 	c.JSON(http.StatusOK, files)
 }
 
-// RegisterNode handles POST /nodes/register
+// RegisterNode validates and saves a storage node's address and capacity.
 func (h *MetadataHandler) RegisterNode(c *gin.Context) {
 	var req common.NodeRegisterRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -251,7 +252,7 @@ func (h *MetadataHandler) RepairFile(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
-// FileIntegrity handles GET /files/:fileId/integrity
+// FileIntegrity returns a file's latest integrity report and check history.
 func (h *MetadataHandler) FileIntegrity(c *gin.Context) {
 	fileID, ok := parseFileID(c)
 	if !ok {
@@ -265,7 +266,7 @@ func (h *MetadataHandler) FileIntegrity(c *gin.Context) {
 	c.JSON(http.StatusOK, report)
 }
 
-// ListIntegrity handles GET /integrity
+// ListIntegrity returns every file with its latest integrity result.
 func (h *MetadataHandler) ListIntegrity(c *gin.Context) {
 	files, err := h.svc.ListIntegrity()
 	if err != nil {
@@ -276,7 +277,7 @@ func (h *MetadataHandler) ListIntegrity(c *gin.Context) {
 	c.JSON(http.StatusOK, files)
 }
 
-// Stats handles GET /stats
+// Stats returns cluster storage, replication, and integrity statistics.
 func (h *MetadataHandler) Stats(c *gin.Context) {
 	stats, err := h.svc.Stats(c.Request.Context())
 	if err != nil {
@@ -291,7 +292,7 @@ var operationTypes = map[string]bool{
 	model.OpUpload: true, model.OpDownload: true, model.OpDelete: true, model.OpVerify: true, model.OpRepair: true,
 }
 
-// ListOperations handles GET /operations?type=UPLOAD&limit=50
+// ListOperations returns recent activity with optional type and count filters.
 func (h *MetadataHandler) ListOperations(c *gin.Context) {
 	opType := strings.ToUpper(c.Query("type"))
 	if opType != "" && !operationTypes[opType] {

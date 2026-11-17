@@ -119,6 +119,7 @@ func (s *MetadataService) VerifyFile(ctx context.Context, fileID uint) (*model.I
 	return check, nil
 }
 
+// runCheck checks replicas and the file checksum, then builds an integrity result.
 func (s *MetadataService) runCheck(ctx context.Context, file *model.File) *model.IntegrityCheck {
 	start := time.Now()
 	check := &model.IntegrityCheck{
@@ -335,6 +336,7 @@ func (s *MetadataService) GetIntegrityReport(fileID uint) (*IntegrityReport, err
 	return report, nil
 }
 
+// summarize collects file metadata and chunk/replica counts for integrity reports.
 func summarize(f *model.File) FileIntegrity {
 	fi := FileIntegrity{
 		FileID:    f.ID,

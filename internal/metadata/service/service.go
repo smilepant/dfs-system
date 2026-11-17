@@ -87,6 +87,7 @@ func (s *MetadataService) GetActiveNodes(ctx context.Context) ([]common.StorageN
 	return nodes, nil
 }
 
+// liveAddresses returns live nodes and their addresses indexed by node ID.
 func (s *MetadataService) liveAddresses(ctx context.Context) (map[string]string, []common.StorageNodeInfo, error) {
 	nodes, err := s.GetActiveNodes(ctx)
 	if err != nil {
@@ -106,6 +107,7 @@ type placement struct {
 	nodes []common.StorageNodeInfo
 }
 
+// newPlacement copies node capacity data to track space during replica placement.
 func newPlacement(nodes []common.StorageNodeInfo) *placement {
 	return &placement{nodes: append([]common.StorageNodeInfo(nil), nodes...)}
 }
@@ -129,6 +131,7 @@ func (p *placement) candidates(size int64, exclude map[string]bool) []common.Sto
 	return out
 }
 
+// record subtracts newly stored replicas from each node's projected free space.
 func (p *placement) record(replicas []model.ChunkReplica, size int64) {
 	for _, r := range replicas {
 		for i := range p.nodes {
@@ -280,6 +283,7 @@ func (s *MetadataService) UploadFile(ctx context.Context, filename string, r io.
 	return dbFile, nil
 }
 
+// uploadChunkToNode sends chunk data and its expected hash to one storage node.
 func (s *MetadataService) uploadChunkToNode(ctx context.Context, address, hash string, data []byte) error {
 	url := fmt.Sprintf("http://%s/chunk/upload?hash=%s", address, hash)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
@@ -374,6 +378,7 @@ func (s *MetadataService) StreamFile(ctx context.Context, file *model.File, w io
 	return nil
 }
 
+// fetchChunkFromReplicas tries live replicas until it finds data matching the chunk hash.
 func (s *MetadataService) fetchChunkFromReplicas(ctx context.Context, chunk model.Chunk, activeNodeMap map[string]string) ([]byte, error) {
 	var lastErr error
 	for _, replica := range chunk.Replicas {
@@ -410,8 +415,10 @@ func (s *MetadataService) fetchChunkFromReplicas(ctx context.Context, chunk mode
 // nodeStatusError is returned when a storage node answers with an unexpected HTTP status.
 type nodeStatusError struct{ code int }
 
+// Error describes the unexpected HTTP status returned by a storage node.
 func (e *nodeStatusError) Error() string { return fmt.Sprintf("node returned status %d", e.code) }
 
+// downloadChunkFromNode fetches a chunk with a bounded response size.
 func (s *MetadataService) downloadChunkFromNode(ctx context.Context, address, hash string) ([]byte, error) {
 	url := fmt.Sprintf("http://%s/chunk/%s", address, hash)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -435,6 +442,7 @@ func (s *MetadataService) downloadChunkFromNode(ctx context.Context, address, ha
 	return io.ReadAll(io.LimitReader(resp.Body, chunking.DefaultChunkSize+1))
 }
 
+// deleteChunkFromNode requests chunk removal, accepting an already missing chunk.
 func (s *MetadataService) deleteChunkFromNode(ctx context.Context, address, hash string) error {
 	url := fmt.Sprintf("http://%s/chunk/%s", address, hash)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)

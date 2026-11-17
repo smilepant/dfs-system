@@ -46,6 +46,7 @@ func (w *Worker) Start(ctx context.Context) {
 	go w.runRegistrationAndHeartbeatLoop(ctx)
 }
 
+// nodeInfo combines this node's identity and address with its current storage usage.
 func (w *Worker) nodeInfo() common.StorageNodeInfo {
 	total, free, err := w.store.GetStats()
 	if err != nil {
@@ -59,6 +60,7 @@ func (w *Worker) nodeInfo() common.StorageNodeInfo {
 	}
 }
 
+// runRegistrationAndHeartbeatLoop registers in etcd and reconnects after lease loss.
 func (w *Worker) runRegistrationAndHeartbeatLoop(ctx context.Context) {
 	period := time.Duration(w.interval) * time.Second
 
@@ -121,6 +123,7 @@ func (w *Worker) heartbeat(ctx context.Context, leaseID clientv3.LeaseID, kaChan
 	}
 }
 
+// tryRegisterWithMetadataServer logs one registration attempt and reports success.
 func (w *Worker) tryRegisterWithMetadataServer() bool {
 	if err := w.registerWithMetadataServer(w.nodeInfo()); err != nil {
 		w.logger.Warn("Failed to register with Metadata Server, will retry", zap.String("url", w.metadataURL), zap.Error(err))
@@ -130,6 +133,7 @@ func (w *Worker) tryRegisterWithMetadataServer() bool {
 	return true
 }
 
+// registerWithMetadataServer posts the node's address and capacity to the metadata API.
 func (w *Worker) registerWithMetadataServer(info common.StorageNodeInfo) error {
 	url := fmt.Sprintf("%s/nodes/register", w.metadataURL)
 	payload := common.NodeRegisterRequest{

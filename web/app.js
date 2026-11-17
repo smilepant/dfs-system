@@ -38,14 +38,17 @@ const state = {
 /* ---------- Server URL ---------- */
 
 const SERVER_KEY = 'dfs.server';
+// Choose the current origin or the local metadata server as the default API URL.
 function defaultServer() {
   return /^https?:$/.test(location.protocol) ? location.origin : 'http://localhost:8000';
 }
+// Restore a saved server URL when browser storage is available.
 function readStoredServer() {
   try { return localStorage.getItem(SERVER_KEY); } catch { return null; }
 }
 let server = readStoredServer() || defaultServer();
 
+// Save the selected API URL and update its sidebar label.
 function setServer(url) {
   server = url.replace(/\/+$/, '');
   try {
@@ -59,9 +62,11 @@ function setServer(url) {
 /* ---------- API ---------- */
 
 class ApiError extends Error {
+  // Keep the HTTP status alongside the message for request error handling.
   constructor(message, status) { super(message); this.status = status; }
 }
 
+// Request JSON from the metadata API with a timeout and readable errors.
 async function api(path, { method = 'GET', timeout = 15000 } = {}) {
   let res;
   try {
@@ -79,10 +84,12 @@ async function api(path, { method = 'GET', timeout = 15000 } = {}) {
 
 /* ---------- Formatting ---------- */
 
+// Escape text before inserting it into generated HTML.
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// Format a byte count using readable storage units.
 function fmtBytes(n) {
   if (n == null || isNaN(n)) return '—';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -94,12 +101,14 @@ function fmtBytes(n) {
 
 const fmtNum = n => Number(n ?? 0).toLocaleString();
 
+// Format a timestamp in the browser's local date and time format.
 function fmtTime(iso) {
   if (!iso) return '—';
   const d = new Date(iso);
   return isNaN(d) ? '—' : d.toLocaleString();
 }
 
+// Describe how long ago a timestamp occurred.
 function relTime(iso) {
   if (!iso) return '—';
   const d = new Date(iso);
@@ -112,6 +121,7 @@ function relTime(iso) {
   return d.toLocaleDateString();
 }
 
+// Build a relative-time label with the full timestamp as its tooltip.
 function timeCell(iso) {
   return `<time datetime="${esc(iso)}" title="${esc(fmtTime(iso))}">${esc(relTime(iso))}</time>`;
 }
@@ -126,6 +136,7 @@ const TYPE_GROUPS = {
   media: ['mp4', 'mkv', 'avi', 'mov', 'webm', 'mp3', 'wav', 'flac', 'ogg', 'm4a'],
   code: ['js', 'ts', 'go', 'py', 'java', 'c', 'cpp', 'h', 'rs', 'sh', 'json', 'yaml', 'yml', 'xml', 'html', 'css', 'sql', 'exe', 'bin', 'dll'],
 };
+// Map a filename extension to its display label and style group.
 function fileType(name) {
   const dot = (name || '').lastIndexOf('.');
   const ext = dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
@@ -133,6 +144,7 @@ function fileType(name) {
   return { label: ext ? ext.slice(0, 4) : 'file', cls: 't-' + group };
 }
 
+// Build a file table cell with its type, name, ID, and optional details link.
 function fileCell(f, { clickable = true } = {}) {
   const t = fileType(f.filename);
   const name = clickable
@@ -177,11 +189,13 @@ const REPAIR_ACTION = {
   SKIPPED: ['warn', 'Skipped'],
 };
 
+// Build a styled status badge from a status-to-label mapping.
 function badge(map, key, fallback) {
   const [cls, label] = map[key] || ['', fallback ?? key ?? '—'];
   return `<span class="badge ${cls}">${esc(label)}</span>`;
 }
 
+// Show a file's current verification/repair activity or latest check result.
 function checkBadge(fileId) {
   if (state.busy.has(fileId)) return `<span class="badge info">${state.busy.get(fileId) === 'repair' ? 'Repairing…' : 'Checking…'}</span>`;
   const c = state.checks.get(fileId);
@@ -192,6 +206,7 @@ const isIssue = c => c && c.status !== 'VERIFIED';
 // Repair can help whenever the last check found damaged, missing or too few replicas.
 const isRepairable = c => !!c && ['DEGRADED', 'CORRUPT', 'UNAVAILABLE'].includes(c.status);
 
+// Build a repair button that reflects whether the file is busy.
 function repairButton(id, cls = 'btn btn-sm') {
   const busy = state.busy.has(id);
   return `<button class="${cls}" type="button" data-action="repair" data-id="${id}" ${busy ? 'disabled' : ''}>` +
@@ -200,16 +215,19 @@ function repairButton(id, cls = 'btn btn-sm') {
 
 /* ---------- Replication (derived from real node + replica data) ---------- */
 
+// Collect live node IDs using lease status, falling back to health when unknown.
 function liveNodeIds() {
   const known = state.nodes.some(n => n.in_cluster != null);
   return new Set(state.nodes.filter(n => (known ? n.in_cluster : n.online)).map(n => n.node_id));
 }
 
+// Limit the displayed replication target to the available live nodes, with a minimum of one.
 function replicationTarget(live) {
   const rf = state.stats?.replication_factor || 1;
   return Math.max(1, Math.min(rf, live.size));
 }
 
+// Show the lowest live replica count across a file's chunks against the target.
 function fileReplication(f, live = liveNodeIds()) {
   const chunks = f.chunks || [];
   if (f.status !== 'ACTIVE' || chunks.length === 0) return '<span class="faint">—</span>';
@@ -228,6 +246,7 @@ function fileReplication(f, live = liveNodeIds()) {
 
 /* ---------- Toasts ---------- */
 
+// Show a notification and return controls to update or dismiss it.
 function toast(message, type = 'info', duration = 4500) {
   const el = document.createElement('div');
   el.className = `toast ${type}`;
@@ -248,6 +267,7 @@ function toast(message, type = 'info', duration = 4500) {
 
 /* ---------- Dialog helpers ---------- */
 
+// Open a confirmation dialog and resolve with the user's choice.
 function confirmDialog({ title, message, ok = 'Confirm', danger = false }) {
   const dlg = $('#confirm-dialog');
   $('#confirm-title').textContent = title;
@@ -261,6 +281,7 @@ function confirmDialog({ title, message, ok = 'Confirm', danger = false }) {
   return new Promise(resolve => dlg.addEventListener('close', () => resolve(dlg.returnValue === 'ok'), { once: true }));
 }
 
+// Copy text to the clipboard and report whether it succeeded.
 async function copyText(text, what = 'Value') {
   try {
     await navigator.clipboard.writeText(text);
@@ -272,6 +293,7 @@ async function copyText(text, what = 'Value') {
 
 /* ---------- Data loading ---------- */
 
+// Refresh cluster data in parallel, retain successful results, and redraw the page.
 async function loadAll() {
   const [stats, nodes, files, integ, ops] = await Promise.allSettled([
     api('/stats'),
@@ -297,6 +319,7 @@ async function loadAll() {
   render();
 }
 
+// Load activity for the selected operation type, or use the unfiltered list.
 async function loadActivity() {
   const type = $('#activity-type').value;
   if (!type) { state.activityOps = null; return; }
@@ -307,6 +330,7 @@ async function loadActivity() {
   }
 }
 
+// Update the connection indicator and any data-loading warning banner.
 function setConnection(ok, partialError) {
   state.connected = ok;
   const conn = $('#conn');
@@ -327,16 +351,19 @@ function setConnection(ok, partialError) {
 
 /* ---------- Rendering ---------- */
 
+// Refresh navigation counts and render the currently selected page.
 function render() {
   renderNavCounts();
   const fn = { overview: renderOverview, files: renderFiles, integrity: renderIntegrity, nodes: renderNodes, activity: renderActivity }[state.page];
   fn();
 }
 
+// Build a loading placeholder spanning the requested table columns.
 function loadingRow(cols) {
   return `<tr class="loading-row"><td colspan="${cols}">Loading…</td></tr>`;
 }
 
+// Update sidebar counts for active files, integrity issues, and offline nodes.
 function renderNavCounts() {
   const active = state.files.filter(f => f.status === 'ACTIVE').length;
   $('#nav-files-count').textContent = state.loaded ? active : '';
@@ -348,6 +375,7 @@ function renderNavCounts() {
   $('#nav-nodes-count').title = offline ? `${offline} node(s) not responding` : '';
 }
 
+// Display cluster metrics, recent files, storage usage, and recent activity.
 function renderOverview() {
   const s = state.stats;
   const online = state.nodes.filter(n => n.online);
@@ -427,12 +455,14 @@ function renderOverview() {
     }).join('');
 }
 
+// Build a node badge from its HTTP health and etcd lease status.
 function nodeHealthBadge(n) {
   if (!n.online) return '<span class="badge err">Offline</span>';
   if (n.in_cluster === false) return '<span class="badge warn" title="Responds to /health but has no live etcd lease">No lease</span>';
   return '<span class="badge ok">Online</span>';
 }
 
+// Apply file search, status and integrity filters, then sort the results.
 function filteredFiles() {
   const { search, status, integrity, sort, dir } = state.filters;
   const q = search.trim().toLowerCase();
@@ -455,6 +485,7 @@ function filteredFiles() {
   return list;
 }
 
+// Render the filtered file list with replication status and file actions.
 function renderFiles() {
   $$('#files-table .sort').forEach(btn => {
     if (btn.dataset.sort === state.filters.sort) btn.setAttribute('aria-sort', state.filters.dir === 'asc' ? 'ascending' : 'descending');
@@ -501,6 +532,7 @@ function renderFiles() {
   }).join('');
 }
 
+// Render active files with their latest checks and verification/repair actions.
 function renderIntegrity() {
   const body = $('#integrity-body');
   const btn = $('#verify-all-btn');
@@ -551,6 +583,7 @@ function renderIntegrity() {
   }).join('');
 }
 
+// Render node reachability, lease status, replica counts, and storage usage.
 function renderNodes() {
   const body = $('#nodes-body');
   if (!state.loaded) { body.innerHTML = loadingRow(8); return; }
@@ -579,6 +612,7 @@ function renderNodes() {
   }).join('');
 }
 
+// Render recorded file operations using the selected activity filter.
 function renderActivity() {
   const body = $('#activity-body');
   if (!state.loaded) { body.innerHTML = loadingRow(6); return; }
@@ -605,12 +639,14 @@ function renderActivity() {
 
 const drawer = $('#drawer');
 
+// Open the details drawer with a title and loading placeholder.
 function openDrawer(title) {
   $('#drawer-title').textContent = title;
   $('#drawer-body').innerHTML = '<p class="muted">Loading…</p>';
   if (!drawer.open) drawer.showModal();
 }
 
+// Fetch file metadata and integrity results for the details drawer.
 async function showFileDetails(id) {
   state.drawer = { kind: 'file', id };
   const f0 = state.files.find(f => f.id === id);
@@ -624,6 +660,7 @@ async function showFileDetails(id) {
   }
 }
 
+// Display file metadata, checksum, available actions, and chunk replica locations.
 function renderFileDetails(f, report) {
   $('#drawer-title').textContent = f.filename;
   const active = f.status === 'ACTIVE';
@@ -667,6 +704,7 @@ function renderFileDetails(f, report) {
   `;
 }
 
+// Fetch a file's integrity report and display it in the drawer.
 async function showReport(id) {
   state.drawer = { kind: 'report', id };
   const f0 = state.files.find(f => f.id === id);
@@ -680,6 +718,7 @@ async function showReport(id) {
   }
 }
 
+// Display checksum comparisons, replica results, repairs, and check history.
 function renderReport(report) {
   const f = report.file;
   $('#drawer-title').textContent = `Integrity report: ${f.filename}`;
@@ -730,6 +769,7 @@ function renderReport(report) {
   `;
 }
 
+// Build a summary and action table for the most recent repair.
 function renderRepairSummary(r) {
   if (!r) return '';
   return `<h3>Last repair</h3>
@@ -744,6 +784,7 @@ function renderRepairSummary(r) {
       </tr>`).join('')}</tbody></table></div></div>`}`;
 }
 
+// Reload the open drawer when it belongs to the changed file.
 function refreshDrawer(id) {
   if (!drawer.open || !state.drawer || state.drawer.id !== id) return;
   if (state.drawer.kind === 'file') showFileDetails(id);
@@ -752,6 +793,7 @@ function refreshDrawer(id) {
 
 /* ---------- Actions ---------- */
 
+// Run a file integrity check and update its cached result and progress state.
 async function verifyFile(id, { quiet = false } = {}) {
   if (state.busy.has(id)) return null;
   const f = state.files.find(x => x.id === id);
@@ -777,6 +819,7 @@ async function verifyFile(id, { quiet = false } = {}) {
   }
 }
 
+// Request replica repair, cache its outcome, and refresh the file's report.
 async function repairFile(id) {
   if (state.busy.has(id)) return;
   const f = state.files.find(x => x.id === id);
@@ -802,6 +845,7 @@ async function repairFile(id) {
   }
 }
 
+// Verify active files sequentially, or stop an existing batch after its current check.
 async function verifyAll() {
   if (state.verifyAll) { state.verifyAll.cancelled = true; return; }
   const targets = state.files.filter(f => f.status === 'ACTIVE').map(f => f.id);
@@ -828,6 +872,7 @@ async function verifyAll() {
   loadAll();
 }
 
+// Confirm deletion, remove the file through the API, and refresh the console.
 async function deleteFile(id) {
   const f = state.files.find(x => x.id === id);
   const name = f ? f.filename : `file #${id}`;
@@ -849,11 +894,13 @@ async function deleteFile(id) {
   }
 }
 
+// Compute a buffer's SHA-256 as a lowercase hexadecimal string.
 async function sha256Hex(buffer) {
   const digest = await crypto.subtle.digest('SHA-256', buffer);
   return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
 }
 
+// Download and save a file, checking its checksum when browser limits allow.
 async function downloadFile(id) {
   const f = state.files.find(x => x.id === id);
   const name = f ? f.filename : `dfs-file-${id}`;
@@ -906,6 +953,7 @@ async function downloadFile(id) {
 
 const uploadDialog = $('#upload-dialog');
 
+// Open the upload dialog and optionally queue newly selected files.
 function openUpload(files) {
   if (!state.uploading) state.uploads = state.uploads.filter(u => u.status === 'queued');
   if (files?.length) addUploads(files);
@@ -913,11 +961,13 @@ function openUpload(files) {
   if (!uploadDialog.open) uploadDialog.showModal();
 }
 
+// Add selected files to the upload queue and refresh its display.
 function addUploads(fileList) {
   for (const file of fileList) state.uploads.push({ file, status: 'queued', progress: 0, message: '' });
   renderUploads();
 }
 
+// Display queued files, transfer progress, upload results, and action availability.
 function renderUploads() {
   const list = $('#upload-queue');
   list.innerHTML = state.uploads.map((u, i) => {
@@ -944,6 +994,7 @@ function renderUploads() {
     [done && `${done} stored`, failed && `${failed} failed`, queued && `${queued} waiting`].filter(Boolean).join(' · ');
 }
 
+// Upload one queued file while tracking transfer progress and the server result.
 function uploadOne(item) {
   return new Promise(resolve => {
     const xhr = new XMLHttpRequest();
@@ -981,6 +1032,7 @@ function uploadOne(item) {
   });
 }
 
+// Process queued uploads sequentially and refresh cluster data after each file.
 async function startUploads() {
   if (state.uploading) return;
   state.uploading = true;
@@ -1003,6 +1055,7 @@ async function startUploads() {
 
 /* ---------- Navigation ---------- */
 
+// Select the page from the URL hash and update navigation and content.
 function route() {
   const name = location.hash.replace(/^#\/?/, '').split('/')[0];
   const page = PAGES[name] ? name : 'overview';
@@ -1019,6 +1072,7 @@ function route() {
   else render();
 }
 
+// Toggle the mobile sidebar, backdrop, and accessible expanded state.
 function setNav(open) {
   $('#sidebar').classList.toggle('open', open);
   $('#scrim').hidden = !open;
